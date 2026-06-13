@@ -29,7 +29,22 @@ struct LevelOrderedCircuit {
   size_t num_wires{0};
   std::array<size_t, static_cast<size_t>(GateType::NumGates)> count{};
   std::vector<wire_t>                  outputs;
+
+  // Communication-depth levels. This preserves the original topological gate
+  // order and contains both interactive and local gates. It is useful for
+  // statistics and for extracting batched interactive gates at each depth.
   std::vector<std::vector<gate_ptr_t>> gates_by_level;
+
+  // For each communication-depth level, local gates are additionally split
+  // into dependency-free sublevels. All gates in
+  // local_gates_by_level[d][l] can be evaluated in parallel after the
+  // interactive gates at communication depth d have completed.
+  //
+  // Example:
+  //   z0 = x0 + y0      local sublevel 0
+  //   z1 = x1 + y1      local sublevel 0
+  //   z2 = z0 - z1      local sublevel 1
+  std::vector<std::vector<std::vector<gate_ptr_t>>> local_gates_by_level;
 
   size_t depth() const { return gates_by_level.size(); }
 };
@@ -621,31 +636,63 @@ class Circuit {
     lc.outputs   = outputs_;
     lc.count.fill(0);
 
+    // wdepth[w] is the communication-depth at which wire w becomes available.
+    // wlocal_rank[w] is the local dependency rank of wire w within wdepth[w].
+    // Non-local outputs and inputs have rank 0.  A local gate at depth d is
+    // assigned to sublevel max(rank of same-depth inputs), and its output rank
+    // becomes sublevel + 1.
     std::vector<size_t> wdepth(num_wires_, 0);
+    std::vector<size_t> wlocal_rank(num_wires_, 0);
     std::vector<size_t> gate_depth(gates_.size(), 0);
+    std::vector<size_t> gate_local_sublevel(gates_.size(), 0);
+
     size_t max_level = 0;
 
     for (size_t gi = 0; gi < gates_.size(); ++gi) {
       const auto& gp = gates_[gi];
-      size_t d = computeDepth(*gp, wdepth);
+      const size_t d = computeDepth(*gp, wdepth);
+      const bool local = isLocal(gp->type);
+      const size_t local_sublevel = local ? computeLocalSublevel(*gp, d, wdepth, wlocal_rank) : 0;
+
       gate_depth[gi] = d;
-      // ShuffleGate has multiple output wires — update depth for all of them.
+      gate_local_sublevel[gi] = local_sublevel;
+
+      // Multi-output gates need all outputs updated.
       if (gp->type == GateType::kShuffle) {
         const auto& sg = static_cast<const ShuffleGate&>(*gp);
-        for (wire_t w : sg.outs) wdepth[w] = d;
+        for (wire_t w : sg.outs) {
+          wdepth[w] = d;
+          wlocal_rank[w] = 0;
+        }
       } else if (gp->type == GateType::kLocalPerm) {
         const auto& lg = static_cast<const LocalPermGate&>(*gp);
-        for (wire_t w : lg.outs) wdepth[w] = d;
+        for (wire_t w : lg.outs) {
+          wdepth[w] = d;
+          wlocal_rank[w] = local_sublevel + 1;
+        }
       } else {
         wdepth[gp->out] = d;
+        wlocal_rank[gp->out] = local ? local_sublevel + 1 : 0;
       }
+
       max_level = std::max(max_level, d);
       ++lc.count[static_cast<size_t>(gp->type)];
     }
 
     lc.gates_by_level.resize(max_level + 1);
-    for (size_t gi = 0; gi < gates_.size(); ++gi)
-      lc.gates_by_level[gate_depth[gi]].push_back(gates_[gi]);
+    lc.local_gates_by_level.resize(max_level + 1);
+
+    for (size_t gi = 0; gi < gates_.size(); ++gi) {
+      const size_t d = gate_depth[gi];
+      lc.gates_by_level[d].push_back(gates_[gi]);
+
+      if (isLocal(gates_[gi]->type)) {
+        const size_t sub = gate_local_sublevel[gi];
+        if (lc.local_gates_by_level[d].size() <= sub)
+          lc.local_gates_by_level[d].resize(sub + 1);
+        lc.local_gates_by_level[d][sub].push_back(gates_[gi]);
+      }
+    }
 
     lc.num_gates = gates_.size();
     return lc;
@@ -667,6 +714,56 @@ class Circuit {
            t == GateType::kRec     ||
            t == GateType::kRecP    ||
            t == GateType::kShuffle;
+  }
+
+  static bool isLocal(GateType t) {
+    return t == GateType::kAdd       ||
+           t == GateType::kSub       ||
+           t == GateType::kCAdd      ||
+           t == GateType::kCSub      ||
+           t == GateType::kCMul      ||
+           t == GateType::kLocalPerm;
+  }
+
+  size_t inputLocalRankAtDepth(wire_t w,
+                               size_t current_depth,
+                               const std::vector<size_t>& wdepth,
+                               const std::vector<size_t>& wlocal_rank) const {
+    return wdepth[w] == current_depth ? wlocal_rank[w] : 0;
+  }
+
+  size_t computeLocalSublevel(const Gate& g,
+                              size_t current_depth,
+                              const std::vector<size_t>& wdepth,
+                              const std::vector<size_t>& wlocal_rank) const {
+    switch (g.type) {
+      case GateType::kAdd:
+      case GateType::kSub: {
+        const auto& g2 = static_cast<const FIn2Gate&>(g);
+        return std::max(inputLocalRankAtDepth(g2.in1, current_depth, wdepth, wlocal_rank),
+                        inputLocalRankAtDepth(g2.in2, current_depth, wdepth, wlocal_rank));
+      }
+
+      case GateType::kCAdd:
+      case GateType::kCSub:
+      case GateType::kCMul: {
+        const auto& g1 = static_cast<const CIn1Gate<T>&>(g);
+        return inputLocalRankAtDepth(g1.in, current_depth, wdepth, wlocal_rank);
+      }
+
+      case GateType::kLocalPerm: {
+        const auto& lg = static_cast<const LocalPermGate&>(g);
+        size_t sublevel = 0;
+        for (wire_t w : lg.payload)
+          sublevel = std::max(sublevel, inputLocalRankAtDepth(w, current_depth, wdepth, wlocal_rank));
+        for (wire_t w : lg.perm_wires)
+          sublevel = std::max(sublevel, inputLocalRankAtDepth(w, current_depth, wdepth, wlocal_rank));
+        return sublevel;
+      }
+
+      default:
+        return 0;
+    }
   }
 
   size_t computeDepth(const Gate& g, const std::vector<size_t>& wdepth) const {

@@ -76,8 +76,8 @@ class OnlineEvaluator {
   // ── Evaluation ────────────────────────────────────────────────────────────
   void evaluate(const LevelOrderedCircuit& lc) {
     wires_.assign(lc.num_wires, RSSShare<T>{T{}, T{}, my_pid_});
-    for (const auto& level : lc.gates_by_level)
-      evalLevel(level);
+    for (size_t i = 0; i < lc.gates_by_level.size(); ++i)
+      evalLevel(i, lc);
   }
 
   /// Evaluate a single level by index (useful for fine-grained benchmarking).
@@ -85,7 +85,12 @@ class OnlineEvaluator {
   void evalLevel(size_t idx, const LevelOrderedCircuit& lc) {
     if (idx == 0)
       wires_.assign(lc.num_wires, RSSShare<T>{T{}, T{}, my_pid_});
-    evalLevel(lc.gates_by_level.at(idx));
+
+    const auto& local_sublevels =
+        idx < lc.local_gates_by_level.size()
+            ? lc.local_gates_by_level[idx]
+            : empty_local_sublevels_;
+    evalLevel(lc.gates_by_level.at(idx), local_sublevels);
   }
 
   // ── Wire access ─────────────────────────────────────────────────────────
@@ -155,6 +160,10 @@ class OnlineEvaluator {
   std::vector<RSSShare<T>>      wires_;
   std::unordered_map<wire_t, T> inputs_;
 
+  static constexpr size_t kParallelLocalGateThreshold = 8192;
+  static constexpr size_t kParallelLocalPermThreshold = 8192;
+  const std::vector<std::vector<gate_ptr_t>> empty_local_sublevels_{};
+
   // Permutation cache for grouped shuffle gates (perm_group_id ≥ 0).
   // Keyed by group id; value is {perm_12, perm_23, perm_31}.
   struct CachedPerms {
@@ -179,7 +188,9 @@ class OnlineEvaluator {
     return it->second;
   }
 
-  void evalLevel(const std::vector<gate_ptr_t>& level) {
+  void evalLevel(const std::vector<gate_ptr_t>& level,
+                 const std::vector<std::vector<gate_ptr_t>>& local_sublevels) {
+    
     std::array<std::vector<const InpGate*>, 3> inp_by_owner{};
     std::vector<const FIn1Gate*> rec_gates;
     std::array<std::vector<const FIn1Gate*>, 3> recp_by_target{};
@@ -224,110 +235,139 @@ class OnlineEvaluator {
       }
     }
 
-    // Interactive gates are already batched by protocol type.
+    // Interactive gates are still batched by protocol type.  After they finish,
+    // all wires at this communication depth are available.  The circuit has
+    // already split local gates at this depth into dependency-free sublevels.
     batchInput(inp_by_owner);
     batchRec(rec_gates);
     batchRecP(recp_by_target);
     batchMul(mul_gates);
     batchShuffle(shuffle_gates);
 
-    // Local gates must be evaluated in original topological order because
-    // local gates in one level may depend on earlier local gates in that same
-    // level.  Keep the dispatch shallow, use static_cast once per gate, and
-    // write RSS components directly to avoid temporary RSSShare objects.
-    for (const auto& gp : level) {
-      switch (gp->type) {
-        case GateType::kAdd: {
-          const auto* g = static_cast<const FIn2Gate*>(gp.get());
-          const auto& a = wires_[g->in1];
-          const auto& b = wires_[g->in2];
-          wires_[g->out] = RSSShare<T>(a.left() + b.left(),
-                                       a.right() + b.right(),
-                                       my_pid_);
-          break;
-        }
+    for (const auto& local_level : local_sublevels)
+      evalLocalSublevel(local_level);
+  }
 
-        case GateType::kSub: {
-          const auto* g = static_cast<const FIn2Gate*>(gp.get());
-          const auto& a = wires_[g->in1];
-          const auto& b = wires_[g->in2];
-          wires_[g->out] = RSSShare<T>(a.left() - b.left(),
-                                       a.right() - b.right(),
-                                       my_pid_);
-          break;
-        }
 
-        case GateType::kCAdd: {
-          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
-          const auto& s = wires_[g->in];
-          T left = s.left();
-          T right = s.right();
+  void evalLocalSublevel(const std::vector<gate_ptr_t>& local_level) {
+    if (local_level.empty()) return;
 
-          // Public constants are injected into exactly one global additive
-          // sub-share.  With this RSS layout, P0's left share is s_0.
-          if (my_pid_ == P0) left += g->cval;
-
-          wires_[g->out] = RSSShare<T>(left, right, my_pid_);
-          break;
-        }
-
-        case GateType::kCSub: {
-          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
-          const auto& s = wires_[g->in];
-          T left = s.left();
-          T right = s.right();
-
-          if (!g->inv) {
-            // out = in - c
-            if (my_pid_ == P0) left -= g->cval;
-          } else {
-            // out = c - in
-            left = T{} - left;
-            right = T{} - right;
-            if (my_pid_ == P0) left += g->cval;
-          }
-
-          wires_[g->out] = RSSShare<T>(left, right, my_pid_);
-          break;
-        }
-
-        case GateType::kCMul: {
-          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
-          const auto& s = wires_[g->in];
-          wires_[g->out] = RSSShare<T>(s.left() * g->cval,
-                                       s.right() * g->cval,
-                                       my_pid_);
-          break;
-        }
-
-        case GateType::kLocalPerm: {
-          const auto* g = static_cast<const LocalPermGate*>(gp.get());
-          const size_t n = g->payload.size();
-
-          if (!g->inv) {
-            // Pull: out[j] = payload[perm[j]].
-            for (size_t j = 0; j < n; ++j) {
-              const size_t src = static_cast<size_t>(wires_[g->perm_wires[j]].left());
-              if (src >= n)
-                throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
-              wires_[g->outs[j]] = wires_[g->payload[src]];
-            }
-          } else {
-            // Push: out[perm[j]] = payload[j].  Output wires are fresh, so no
-            // temporary result vector is needed.
-            for (size_t j = 0; j < n; ++j) {
-              const size_t dst = static_cast<size_t>(wires_[g->perm_wires[j]].left());
-              if (dst >= n)
-                throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
-              wires_[g->outs[dst]] = wires_[g->payload[j]];
-            }
-          }
-          break;
-        }
-
-        default:
-          break;
+    bool has_local_perm = false;
+    for (const auto& gp : local_level) {
+      if (gp->type == GateType::kLocalPerm) {
+        has_local_perm = true;
+        break;
       }
+    }
+
+    // Local permutation can throw on malformed indices, so keep the outer loop
+    // serial when this sublevel contains kLocalPerm.  Large kLocalPerm gates are
+    // parallelised internally after a serial validation pass.
+    if (!has_local_perm && local_level.size() >= kParallelLocalGateThreshold) {
+    #pragma omp parallel for schedule(static)
+        for (long long i = 0; i < static_cast<long long>(local_level.size()); ++i)
+            evalLocalGate(*local_level[static_cast<size_t>(i)]);
+        } else {
+          for (const auto& gp : local_level)
+            evalLocalGate(*gp);
+        }
+  }
+
+  void evalLocalGate(const Gate& gate) {
+    switch (gate.type) {
+      case GateType::kAdd: {
+        const auto& g = static_cast<const FIn2Gate&>(gate);
+        const auto& a = wires_[g.in1];
+        const auto& b = wires_[g.in2];
+        wires_[g.out] = RSSShare<T>(a.left() + b.left(),
+                                    a.right() + b.right(),
+                                    my_pid_);
+        break;
+      }
+
+      case GateType::kSub: {
+        const auto& g = static_cast<const FIn2Gate&>(gate);
+        const auto& a = wires_[g.in1];
+        const auto& b = wires_[g.in2];
+        wires_[g.out] = RSSShare<T>(a.left() - b.left(),
+                                    a.right() - b.right(),
+                                    my_pid_);
+        break;
+      }
+
+      case GateType::kCAdd: {
+        const auto& g = static_cast<const CIn1Gate<T>&>(gate);
+        const auto& s = wires_[g.in];
+        T left = s.left();
+        T right = s.right();
+        if (my_pid_ == P0) left += g.cval;
+        wires_[g.out] = RSSShare<T>(left, right, my_pid_);
+        break;
+      }
+
+      case GateType::kCSub: {
+        const auto& g = static_cast<const CIn1Gate<T>&>(gate);
+        const auto& s = wires_[g.in];
+        T left = s.left();
+        T right = s.right();
+
+        if (!g.inv) {
+          if (my_pid_ == P0) left -= g.cval;
+        } else {
+          left = T{} - left;
+          right = T{} - right;
+          if (my_pid_ == P0) left += g.cval;
+        }
+
+        wires_[g.out] = RSSShare<T>(left, right, my_pid_);
+        break;
+      }
+
+      case GateType::kCMul: {
+        const auto& g = static_cast<const CIn1Gate<T>&>(gate);
+        const auto& s = wires_[g.in];
+        wires_[g.out] = RSSShare<T>(s.left() * g.cval,
+                                    s.right() * g.cval,
+                                    my_pid_);
+        break;
+      }
+
+      case GateType::kLocalPerm:
+        evalLocalPermGate(static_cast<const LocalPermGate&>(gate));
+        break;
+
+      default:
+        break;
+    }
+  }
+
+  void evalLocalPermGate(const LocalPermGate& g) {
+    const size_t n = g.payload.size();
+    std::vector<size_t> perm(n);
+
+    // Validate serially so malformed circuits throw normally instead of from
+    // inside an OpenMP worker.
+    for (size_t j = 0; j < n; ++j) {
+      perm[j] = static_cast<size_t>(wires_[g.perm_wires[j]].left());
+      if (perm[j] >= n)
+        throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
+    }
+
+    if (!g.inv) {
+      // Pull: out[j] = payload[perm[j]].
+      #pragma omp parallel for if(n >= kParallelLocalPermThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              wires_[g.outs[j]] = wires_[g.payload[perm[j]]];
+            }
+    } else {
+      // Push: out[perm[j]] = payload[j].  Safe for valid permutations because
+      // every output location is written exactly once.
+      #pragma omp parallel for if(n >= kParallelLocalPermThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              wires_[g.outs[perm[j]]] = wires_[g.payload[j]];
+            }
     }
   }
 
