@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -230,80 +231,100 @@ class OnlineEvaluator {
     batchMul(mul_gates);
     batchShuffle(shuffle_gates);
 
-    // Local gates must be evaluated in the original topological order because
-    // local gates in one level may depend on previous local gates in that same
-    // level.  Keep this as one dispatch and write RSS components directly.
+    // Local gates must be evaluated in original topological order because
+    // local gates in one level may depend on earlier local gates in that same
+    // level.  Keep the dispatch shallow, use static_cast once per gate, and
+    // write RSS components directly to avoid temporary RSSShare objects.
     for (const auto& gp : level) {
       switch (gp->type) {
-        case GateType::kAdd:
-          const auto& a = wires_[gp->in1];
-          const auto& b = wires_[gp->in2];
-          wires_[gp->out] = RSSShare<T>(a.left() + b.left(),
+        case GateType::kAdd: {
+          const auto* g = static_cast<const FIn2Gate*>(gp.get());
+          const auto& a = wires_[g->in1];
+          const auto& b = wires_[g->in2];
+          wires_[g->out] = RSSShare<T>(a.left() + b.left(),
                                        a.right() + b.right(),
                                        my_pid_);
           break;
-        case GateType::kSub:
-          const auto& a = wires_[gp->in1];
-          const auto& b = wires_[gp->in2];
-          wires_[gp->out] = RSSShare<T>(a.left() - b.left(),
+        }
+
+        case GateType::kSub: {
+          const auto* g = static_cast<const FIn2Gate*>(gp.get());
+          const auto& a = wires_[g->in1];
+          const auto& b = wires_[g->in2];
+          wires_[g->out] = RSSShare<T>(a.left() - b.left(),
                                        a.right() - b.right(),
                                        my_pid_);
           break;
-        case GateType::kCAdd:
-          const auto& s = wires_[gp->in];
+        }
+
+        case GateType::kCAdd: {
+          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
+          const auto& s = wires_[g->in];
           T left = s.left();
           T right = s.right();
 
-          // Public constants are injected into one global additive sub-share only.
-          if (my_pid_ == P0) left += gp->cval;
+          // Public constants are injected into exactly one global additive
+          // sub-share.  With this RSS layout, P0's left share is s_0.
+          if (my_pid_ == P0) left += g->cval;
 
-          wires_[gp->out] = RSSShare<T>(left, right, my_pid_);
+          wires_[g->out] = RSSShare<T>(left, right, my_pid_);
           break;
-        case GateType::kCSub:
-          const auto& s = wires_[gp->in];
+        }
+
+        case GateType::kCSub: {
+          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
+          const auto& s = wires_[g->in];
           T left = s.left();
           T right = s.right();
 
-          if (!gp->inv) {
+          if (!g->inv) {
             // out = in - c
-            if (my_pid_ == P0) left -= gp->cval;
+            if (my_pid_ == P0) left -= g->cval;
           } else {
             // out = c - in
             left = T{} - left;
             right = T{} - right;
-            if (my_pid_ == P0) left += gp->cval;
+            if (my_pid_ == P0) left += g->cval;
           }
 
-          wires_[gp->out] = RSSShare<T>(left, right, my_pid_);
+          wires_[g->out] = RSSShare<T>(left, right, my_pid_);
           break;
-        case GateType::kCMul:
-          const auto& s = wires_[gp->in];
-          wires_[gp->out] = RSSShare<T>(s.left() * gp->cval,
-                                        s.right() * gp->cval,
-                                        my_pid_);
-          break;
-        case GateType::kLocalPerm:
-          const size_t n = gp->payload.size();
+        }
 
-          if (!gp->inv) {
+        case GateType::kCMul: {
+          const auto* g = static_cast<const CIn1Gate<T>*>(gp.get());
+          const auto& s = wires_[g->in];
+          wires_[g->out] = RSSShare<T>(s.left() * g->cval,
+                                       s.right() * g->cval,
+                                       my_pid_);
+          break;
+        }
+
+        case GateType::kLocalPerm: {
+          const auto* g = static_cast<const LocalPermGate*>(gp.get());
+          const size_t n = g->payload.size();
+
+          if (!g->inv) {
             // Pull: out[j] = payload[perm[j]].
             for (size_t j = 0; j < n; ++j) {
-              const size_t src = static_cast<size_t>(wires_[gp->perm_wires[j]].left());
+              const size_t src = static_cast<size_t>(wires_[g->perm_wires[j]].left());
               if (src >= n)
                 throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
-              wires_[gp->outs[j]] = wires_[gp->payload[src]];
+              wires_[g->outs[j]] = wires_[g->payload[src]];
             }
           } else {
             // Push: out[perm[j]] = payload[j].  Output wires are fresh, so no
             // temporary result vector is needed.
             for (size_t j = 0; j < n; ++j) {
-              const size_t dst = static_cast<size_t>(wires_[gp->perm_wires[j]].left());
+              const size_t dst = static_cast<size_t>(wires_[g->perm_wires[j]].left());
               if (dst >= n)
                 throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
-              wires_[gp->outs[dst]] = wires_[gp->payload[j]];
+              wires_[g->outs[dst]] = wires_[g->payload[j]];
             }
           }
           break;
+        }
+
         default:
           break;
       }
@@ -523,7 +544,15 @@ class OnlineEvaluator {
     // Per-gate intermediate state carried across phases.
     struct Mat {
       size_t n{0};
-      std::vector<size_t> perm_12, perm_23, perm_31;
+
+      // For uncached groups, these vectors own the sampled permutations.
+      // For cached groups, perm_* point directly into perm_cache_, avoiding
+      // O(n) copies of three permutation vectors for every repeated shuffle.
+      std::vector<size_t> perm_12_storage, perm_23_storage, perm_31_storage;
+      const std::vector<size_t>* perm_12{nullptr};
+      const std::vector<size_t>* perm_23{nullptr};
+      const std::vector<size_t>* perm_31{nullptr};
+
       std::vector<T> Z12, Z23, Z31, A_tilde, B_tilde;
       std::vector<T> X3, Y3;        // computed during phase-2 receives
       std::vector<T> C_tilde_1;     // P1: X3 − B_tilde  (staged for round-2 send)
@@ -537,7 +566,6 @@ class OnlineEvaluator {
       Mat& m = mats[gi];
       m.n = g.ins.size();
       const size_t n = m.n;
-      m.perm_12.resize(n); m.perm_23.resize(n); m.perm_31.resize(n);
       m.Z12.resize(n); m.Z23.resize(n); m.Z31.resize(n);
       m.A_tilde.resize(n); m.B_tilde.resize(n);
       m.X3.resize(n); m.Y3.resize(n);
@@ -549,9 +577,9 @@ class OnlineEvaluator {
         if (it != perm_cache_.end()) {
           checkCachedPermSize(gid, it->second, n);
           cached_perms = &it->second;
-          m.perm_12 = cached_perms->perm_12;
-          m.perm_23 = cached_perms->perm_23;
-          m.perm_31 = cached_perms->perm_31;
+          m.perm_12 = &cached_perms->perm_12;
+          m.perm_23 = &cached_perms->perm_23;
+          m.perm_31 = &cached_perms->perm_31;
         }
       }
 
@@ -562,7 +590,8 @@ class OnlineEvaluator {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_next<uint64_t>(k.data(), n);
-          m.perm_12 = argsort(k);
+          m.perm_12_storage = argsort(k);
+          m.perm_12 = &m.perm_12_storage;
         }
         prg_.next_next<T>(m.Z12.data(), n);
         prg_.next_next<T>(m.B_tilde.data(), n);
@@ -570,7 +599,8 @@ class OnlineEvaluator {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_prev<uint64_t>(k.data(), n);
-          m.perm_12 = argsort(k);
+          m.perm_12_storage = argsort(k);
+          m.perm_12 = &m.perm_12_storage;
         }
         prg_.next_prev<T>(m.Z12.data(), n);
         prg_.next_prev<T>(m.B_tilde.data(), n);
@@ -581,14 +611,16 @@ class OnlineEvaluator {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_next<uint64_t>(k.data(), n);
-          m.perm_23 = argsort(k);
+          m.perm_23_storage = argsort(k);
+          m.perm_23 = &m.perm_23_storage;
         }
         prg_.next_next<T>(m.Z23.data(), n);
       } else if (my_pid_ == 2) {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_prev<uint64_t>(k.data(), n);
-          m.perm_23 = argsort(k);
+          m.perm_23_storage = argsort(k);
+          m.perm_23 = &m.perm_23_storage;
         }
         prg_.next_prev<T>(m.Z23.data(), n);
       }
@@ -598,7 +630,8 @@ class OnlineEvaluator {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_next<uint64_t>(k.data(), n);
-          m.perm_31 = argsort(k);
+          m.perm_31_storage = argsort(k);
+          m.perm_31 = &m.perm_31_storage;
         }
         prg_.next_next<T>(m.Z31.data(), n);
         prg_.next_next<T>(m.A_tilde.data(), n);
@@ -606,7 +639,8 @@ class OnlineEvaluator {
         if (cached_perms == nullptr) {
           std::vector<uint64_t> k(n);
           prg_.next_prev<uint64_t>(k.data(), n);
-          m.perm_31 = argsort(k);
+          m.perm_31_storage = argsort(k);
+          m.perm_31 = &m.perm_31_storage;
         }
         prg_.next_prev<T>(m.Z31.data(), n);
         prg_.next_prev<T>(m.A_tilde.data(), n);
@@ -615,7 +649,7 @@ class OnlineEvaluator {
       // First occurrence of a group: cache only the permutation indices.
       // Subsequent occurrences reuse the cached indices but use fresh masks.
       if (gid >= 0 && cached_perms == nullptr) {
-        perm_cache_[gid] = CachedPerms{n, m.perm_12, m.perm_23, m.perm_31};
+        perm_cache_[gid] = CachedPerms{n, m.perm_12_storage, m.perm_23_storage, m.perm_31_storage};
       }
 
       // Round-1 sends
@@ -624,10 +658,10 @@ class OnlineEvaluator {
         std::vector<T> V(n);
         for (size_t i = 0; i < n; ++i)
           V[i] = wires_[g.ins[i]].left() + wires_[g.ins[i]].right() + m.Z12[i];
-        std::vector<T> X1 = applyPerm(m.perm_12, V);
+        std::vector<T> X1 = applyPerm(*m.perm_12, V);
         std::vector<T> X2(n);
         for (size_t i = 0; i < n; ++i) X2[i] = X1[i] + m.Z31[i];
-        X2 = applyPerm(m.perm_31, X2);
+        X2 = applyPerm(*m.perm_31, X2);
         net_.send_ring<T>(X2.data(), n, 1);  // P0 → P1
       }
       if (my_pid_ == 1) {
@@ -635,7 +669,7 @@ class OnlineEvaluator {
         std::vector<T> W(n);
         for (size_t i = 0; i < n; ++i)
           W[i] = wires_[g.ins[i]].right() - m.Z12[i];
-        std::vector<T> Y1 = applyPerm(m.perm_12, W);
+        std::vector<T> Y1 = applyPerm(*m.perm_12, W);
         net_.send_ring<T>(Y1.data(), n, 2);  // P1 → P2
       }
     }
@@ -652,7 +686,7 @@ class OnlineEvaluator {
         std::vector<T> X2(n);
         net_.recv_ring<T>(X2.data(), n, 0);
         for (size_t i = 0; i < n; ++i) m.X3[i] = X2[i] + m.Z23[i];
-        m.X3 = applyPerm(m.perm_23, m.X3);
+        m.X3 = applyPerm(*m.perm_23, m.X3);
         m.C_tilde_1.resize(n);
         for (size_t i = 0; i < n; ++i) m.C_tilde_1[i] = m.X3[i] - m.B_tilde[i];
         net_.send_ring<T>(m.C_tilde_1.data(), n, 2);  // P1 → P2
@@ -663,9 +697,9 @@ class OnlineEvaluator {
         net_.recv_ring<T>(Y1.data(), n, 1);
         std::vector<T> Y2(n);
         for (size_t i = 0; i < n; ++i) Y2[i] = Y1[i] - m.Z31[i];
-        Y2 = applyPerm(m.perm_31, Y2);
+        Y2 = applyPerm(*m.perm_31, Y2);
         for (size_t i = 0; i < n; ++i) m.Y3[i] = Y2[i] - m.Z23[i];
-        m.Y3 = applyPerm(m.perm_23, m.Y3);
+        m.Y3 = applyPerm(*m.perm_23, m.Y3);
         m.C_tilde_2.resize(n);
         for (size_t i = 0; i < n; ++i) m.C_tilde_2[i] = m.Y3[i] - m.A_tilde[i];
         net_.send_ring<T>(m.C_tilde_2.data(), n, 1);  // P2 → P1
