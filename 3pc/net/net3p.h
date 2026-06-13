@@ -1,7 +1,7 @@
 #pragma once
 
 #include <emp-tool/emp-tool.h>
-#include "3pc/core/types.h"
+#include "3pc/utils/types.h"
 #include <cerrno>
 #include <cstdio>
 #include <cstring>

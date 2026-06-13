@@ -2,10 +2,11 @@
 
 #include "3pc/arith/offline_evaluator.h"
 #include "3pc/circuit/circuit.h"
-#include "3pc/core/prg3p.h"
-#include "3pc/core/share.h"
+#include "3pc/utils/prg3p.h"
+#include "3pc/utils/share.h"
 #include "3pc/net/net3p.h"
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <numeric>
 #include <stdexcept>
@@ -156,9 +157,18 @@ class OnlineEvaluator {
   // Permutation cache for grouped shuffle gates (perm_group_id ≥ 0).
   // Keyed by group id; value is {perm_12, perm_23, perm_31}.
   struct CachedPerms {
+    size_t n{0};
     std::vector<size_t> perm_12, perm_23, perm_31;
   };
   std::unordered_map<int, CachedPerms> perm_cache_;
+
+  static void checkCachedPermSize(int gid, const CachedPerms& cp, size_t n) {
+    if (cp.n != n) {
+      throw std::runtime_error(
+          "OnlineEvaluator: perm_group_id " + std::to_string(gid) +
+          " reused with different vector size");
+    }
+  }
 
   T getInput(wire_t w) const {
     auto it = inputs_.find(w);
@@ -175,10 +185,20 @@ class OnlineEvaluator {
     std::vector<const FIn2Gate*> mul_gates;
     std::vector<const ShuffleGate*> shuffle_gates;
 
+    inp_by_owner[0].reserve(level.size());
+    inp_by_owner[1].reserve(level.size());
+    inp_by_owner[2].reserve(level.size());
+    rec_gates.reserve(level.size());
+    recp_by_target[0].reserve(level.size());
+    recp_by_target[1].reserve(level.size());
+    recp_by_target[2].reserve(level.size());
+    mul_gates.reserve(level.size());
+    shuffle_gates.reserve(level.size());
+
     for (const auto& gp : level) {
       switch (gp->type) {
         case GateType::kInp: {
-          auto* g = static_cast<const InpGate*>(gp.get());
+          const auto* g = static_cast<const InpGate*>(gp.get());
           if (g->owner >= 0 && g->owner < 3)
             inp_by_owner[g->owner].push_back(g);
           break;
@@ -187,7 +207,7 @@ class OnlineEvaluator {
           rec_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
           break;
         case GateType::kRecP: {
-          auto* g = static_cast<const FIn1Gate*>(gp.get());
+          const auto* g = static_cast<const FIn1Gate*>(gp.get());
           if (g->owner >= 0 && g->owner < 3)
             recp_by_target[g->owner].push_back(g);
           break;
@@ -198,29 +218,94 @@ class OnlineEvaluator {
         case GateType::kShuffle:
           shuffle_gates.push_back(static_cast<const ShuffleGate*>(gp.get()));
           break;
-        default: break;
+        default:
+          break;
       }
     }
 
-    // Interactive gates
+    // Interactive gates are already batched by protocol type.
     batchInput(inp_by_owner);
     batchRec(rec_gates);
     batchRecP(recp_by_target);
     batchMul(mul_gates);
     batchShuffle(shuffle_gates);
 
-    // Local gates
+    // Local gates must be evaluated in the original topological order because
+    // local gates in one level may depend on previous local gates in that same
+    // level.  Keep this as one dispatch and write RSS components directly.
     for (const auto& gp : level) {
       switch (gp->type) {
         case GateType::kAdd:
-        case GateType::kSub:
-        case GateType::kCAdd:
-        case GateType::kCSub:
-        case GateType::kCMul:
-        case GateType::kLocalPerm:
-          evalLocalGate(*gp);
+          const auto& a = wires_[gp->in1];
+          const auto& b = wires_[gp->in2];
+          wires_[gp->out] = RSSShare<T>(a.left() + b.left(),
+                                       a.right() + b.right(),
+                                       my_pid_);
           break;
-        default: break;
+        case GateType::kSub:
+          const auto& a = wires_[gp->in1];
+          const auto& b = wires_[gp->in2];
+          wires_[gp->out] = RSSShare<T>(a.left() - b.left(),
+                                       a.right() - b.right(),
+                                       my_pid_);
+          break;
+        case GateType::kCAdd:
+          const auto& s = wires_[gp->in];
+          T left = s.left();
+          T right = s.right();
+
+          // Public constants are injected into one global additive sub-share only.
+          if (my_pid_ == P0) left += gp->cval;
+
+          wires_[gp->out] = RSSShare<T>(left, right, my_pid_);
+          break;
+        case GateType::kCSub:
+          const auto& s = wires_[gp->in];
+          T left = s.left();
+          T right = s.right();
+
+          if (!gp->inv) {
+            // out = in - c
+            if (my_pid_ == P0) left -= gp->cval;
+          } else {
+            // out = c - in
+            left = T{} - left;
+            right = T{} - right;
+            if (my_pid_ == P0) left += gp->cval;
+          }
+
+          wires_[gp->out] = RSSShare<T>(left, right, my_pid_);
+          break;
+        case GateType::kCMul:
+          const auto& s = wires_[gp->in];
+          wires_[gp->out] = RSSShare<T>(s.left() * gp->cval,
+                                        s.right() * gp->cval,
+                                        my_pid_);
+          break;
+        case GateType::kLocalPerm:
+          const size_t n = gp->payload.size();
+
+          if (!gp->inv) {
+            // Pull: out[j] = payload[perm[j]].
+            for (size_t j = 0; j < n; ++j) {
+              const size_t src = static_cast<size_t>(wires_[gp->perm_wires[j]].left());
+              if (src >= n)
+                throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
+              wires_[gp->outs[j]] = wires_[gp->payload[src]];
+            }
+          } else {
+            // Push: out[perm[j]] = payload[j].  Output wires are fresh, so no
+            // temporary result vector is needed.
+            for (size_t j = 0; j < n; ++j) {
+              const size_t dst = static_cast<size_t>(wires_[gp->perm_wires[j]].left());
+              if (dst >= n)
+                throw std::runtime_error("OnlineEvaluator: local permutation index out of range");
+              wires_[gp->outs[dst]] = wires_[gp->payload[j]];
+            }
+          }
+          break;
+        default:
+          break;
       }
     }
   }
@@ -457,65 +542,80 @@ class OnlineEvaluator {
       m.A_tilde.resize(n); m.B_tilde.resize(n);
       m.X3.resize(n); m.Y3.resize(n);
 
-      // Pair 12
+      const int gid = g.perm_group_id;
+      const CachedPerms* cached_perms = nullptr;
+      if (gid >= 0) {
+        auto it = perm_cache_.find(gid);
+        if (it != perm_cache_.end()) {
+          checkCachedPermSize(gid, it->second, n);
+          cached_perms = &it->second;
+          m.perm_12 = cached_perms->perm_12;
+          m.perm_23 = cached_perms->perm_23;
+          m.perm_31 = cached_perms->perm_31;
+        }
+      }
+
+      // Pair 12.
+      // If the group permutation is cached, skip key generation and sorting;
+      // still sample fresh masks for this shuffle gate.
       if (my_pid_ == 0) {
-        std::vector<uint64_t> k(n);
-        prg_.next_next<uint64_t>(k.data(), n);
-        m.perm_12 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_next<uint64_t>(k.data(), n);
+          m.perm_12 = argsort(k);
+        }
         prg_.next_next<T>(m.Z12.data(), n);
         prg_.next_next<T>(m.B_tilde.data(), n);
       } else if (my_pid_ == 1) {
-        std::vector<uint64_t> k(n);
-        prg_.next_prev<uint64_t>(k.data(), n);
-        m.perm_12 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_prev<uint64_t>(k.data(), n);
+          m.perm_12 = argsort(k);
+        }
         prg_.next_prev<T>(m.Z12.data(), n);
         prg_.next_prev<T>(m.B_tilde.data(), n);
       }
 
-      // Pair 23
+      // Pair 23.
       if (my_pid_ == 1) {
-        std::vector<uint64_t> k(n);
-        prg_.next_next<uint64_t>(k.data(), n);
-        m.perm_23 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_next<uint64_t>(k.data(), n);
+          m.perm_23 = argsort(k);
+        }
         prg_.next_next<T>(m.Z23.data(), n);
       } else if (my_pid_ == 2) {
-        std::vector<uint64_t> k(n);
-        prg_.next_prev<uint64_t>(k.data(), n);
-        m.perm_23 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_prev<uint64_t>(k.data(), n);
+          m.perm_23 = argsort(k);
+        }
         prg_.next_prev<T>(m.Z23.data(), n);
       }
 
-      // Pair 31
+      // Pair 31.
       if (my_pid_ == 2) {
-        std::vector<uint64_t> k(n);
-        prg_.next_next<uint64_t>(k.data(), n);
-        m.perm_31 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_next<uint64_t>(k.data(), n);
+          m.perm_31 = argsort(k);
+        }
         prg_.next_next<T>(m.Z31.data(), n);
         prg_.next_next<T>(m.A_tilde.data(), n);
       } else if (my_pid_ == 0) {
-        std::vector<uint64_t> k(n);
-        prg_.next_prev<uint64_t>(k.data(), n);
-        m.perm_31 = argsort(k);
+        if (cached_perms == nullptr) {
+          std::vector<uint64_t> k(n);
+          prg_.next_prev<uint64_t>(k.data(), n);
+          m.perm_31 = argsort(k);
+        }
         prg_.next_prev<T>(m.Z31.data(), n);
         prg_.next_prev<T>(m.A_tilde.data(), n);
       }
 
-      // If this gate belongs to a permutation group, either cache the freshly
-      // derived permutation (first occurrence) or replace it with the cached
-      // one (subsequent occurrences).  Masks (Z12, Z23, Z31, Ã, B̃) are always
-      // fresh — only the permutation indices are reused.
-      const int gid = g.perm_group_id;
-      if (gid >= 0) {
-        auto it = perm_cache_.find(gid);
-        if (it == perm_cache_.end()) {
-          // First occurrence: store what we just derived.
-          perm_cache_[gid] = {m.perm_12, m.perm_23, m.perm_31};
-        } else {
-          // Subsequent occurrence: override with cached permutation.
-          m.perm_12 = it->second.perm_12;
-          m.perm_23 = it->second.perm_23;
-          m.perm_31 = it->second.perm_31;
-        }
+      // First occurrence of a group: cache only the permutation indices.
+      // Subsequent occurrences reuse the cached indices but use fresh masks.
+      if (gid >= 0 && cached_perms == nullptr) {
+        perm_cache_[gid] = CachedPerms{n, m.perm_12, m.perm_23, m.perm_31};
       }
 
       // Round-1 sends
@@ -605,66 +705,6 @@ class OnlineEvaluator {
     }
   }
 
-  // ── Local gate evaluation (no communication) ──────────────────────────────
-  void evalLocalGate(const Gate& g) {
-    switch (g.type) {
-      case GateType::kAdd: {
-        const auto& g2 = static_cast<const FIn2Gate&>(g);
-        wires_[g2.out] = wires_[g2.in1] + wires_[g2.in2];
-        break;
-      }
-      case GateType::kSub: {
-        const auto& g2 = static_cast<const FIn2Gate&>(g);
-        wires_[g2.out] = wires_[g2.in1] - wires_[g2.in2];
-        break;
-      }
-      case GateType::kCAdd: {
-        const auto& gc = static_cast<const CIn1Gate<T>&>(g);
-        RSSShare<T> s = wires_[gc.in];
-        s.add_public(gc.cval);
-        wires_[gc.out] = s;
-        break;
-      }
-      case GateType::kCMul: {
-        const auto& gc = static_cast<const CIn1Gate<T>&>(g);
-        wires_[gc.out] = wires_[gc.in] * gc.cval;
-        break;
-      }
-      case GateType::kCSub: {
-        const auto& gc = static_cast<const CIn1Gate<T>&>(g);
-          // out = in - c
-          RSSShare<T> s = wires_[gc.in];
-          s.sub_public(gc.cval, gc.inv);
-          wires_[gc.out] = s;
-        break;
-      }
-      case GateType::kLocalPerm: {
-        const auto& lp = static_cast<const LocalPermGate&>(g);
-        const size_t n = lp.payload.size();
-        // Read the permutation indices from the reconstructed perm wires.
-        // After kRec, left() holds the plaintext value.
-        std::vector<size_t> perm(n);
-        for (size_t i = 0; i < n; ++i)
-          perm[i] = static_cast<size_t>(wires_[lp.perm_wires[i]].left());
-
-        std::vector<RSSShare<T>> result(n, RSSShare<T>(T{}, T{}, my_pid_));
-        if (!lp.inv) {
-          // Forward (pull): out[j] = payload[perm[j]]
-          for (size_t j = 0; j < n; ++j)
-            result[j] = wires_[lp.payload[perm[j]]];
-        } else {
-          // Inverse (push): out[perm[j]] = payload[j]
-          for (size_t j = 0; j < n; ++j)
-            result[perm[j]] = wires_[lp.payload[j]];
-        }
-        for (size_t j = 0; j < n; ++j)
-          wires_[lp.outs[j]] = result[j];
-        break;
-      }
-      default:
-        throw std::runtime_error("OnlineEvaluator::evalLocalGate: not a local gate");
-    }
-  }
 };
 
 }  // namespace threepc
