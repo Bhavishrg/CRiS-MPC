@@ -319,7 +319,15 @@ class OnlineEvaluator {
         const auto& s = wires_[g.in];
         T left = s.left();
         T right = s.right();
-        if (my_pid_ == P0) left += g.cval;
+
+        // Public constants are injected into replicated sub-share s_0.
+        // Since s_0 is held by P0 as its left share and by P2 as its
+        // right share, both copies must be updated.  Updating only P0.left
+        // makes reconstruction correct for P0/P1 but wrong for P2 and also
+        // breaks later multiplication with this value.
+        if (my_pid_ == P0) left  += g.cval;
+        if (my_pid_ == P2) right += g.cval;
+
         wires_[g.out] = RSSShare<T>(left, right, my_pid_);
         break;
       }
@@ -331,11 +339,16 @@ class OnlineEvaluator {
         T right = s.right();
 
         if (!g.inv) {
-          if (my_pid_ == P0) left -= g.cval;
+          // out = in - c.  Subtract c from canonical public sub-share s_0.
+          if (my_pid_ == P0) left  -= g.cval;
+          if (my_pid_ == P2) right -= g.cval;
         } else {
+          // out = c - in.  First negate the replicated share, then inject c
+          // into canonical public sub-share s_0.
           left = T{} - left;
           right = T{} - right;
-          if (my_pid_ == P0) left += g.cval;
+          if (my_pid_ == P0) left  += g.cval;
+          if (my_pid_ == P2) right += g.cval;
         }
 
         wires_[g.out] = RSSShare<T>(left, right, my_pid_);

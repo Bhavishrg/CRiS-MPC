@@ -60,7 +60,10 @@ class RSSShare {
    * This keeps the invariant: left_P0 + left_P1 + left_P2 = s + c.
    */
   RSSShare& add_public(T c) {
-    if (pid_ == P0) left_ += c;
+    // Public constants are injected into replicated sub-share s_0.
+    // P0 holds s_0 as left_, and P2 holds s_0 as right_.
+    if (pid_ == P0) left_  += c;
+    if (pid_ == P2) right_ += c;
     return *this;
   }
 
@@ -69,7 +72,10 @@ class RSSShare {
    * Only P0 subtracts c from its left share.
    */
   RSSShare& sub_public(T c) {
-    if (pid_ == P0) left_ -= c;
+    // Public constants are injected into replicated sub-share s_0.
+    // P0 holds s_0 as left_, and P2 holds s_0 as right_.
+    if (pid_ == P0) left_  -= c;
+    if (pid_ == P2) right_ -= c;
     return *this;
   }
 
