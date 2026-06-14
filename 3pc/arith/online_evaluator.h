@@ -172,6 +172,7 @@ class OnlineEvaluator {
   std::vector<RSSShare<T>>      wires_;
   std::unordered_map<wire_t, T> inputs_;
 
+  static constexpr size_t kParallelInteractiveThreshold = 8192;
   static constexpr size_t kParallelLocalGateThreshold = 8192;
   static constexpr size_t kParallelLocalPermThreshold = 8192;
   const std::vector<std::vector<gate_ptr_t>> empty_local_sublevels_{};

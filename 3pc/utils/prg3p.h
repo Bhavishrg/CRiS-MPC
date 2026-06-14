@@ -1,6 +1,6 @@
 #pragma once
 
-#include "3pc/core/types.h"
+#include "3pc/utils/types.h"
 #include "3pc/net/net3p.h"
 #include <emp-tool/emp-tool.h>
 #include <stdexcept>

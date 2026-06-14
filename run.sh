@@ -32,6 +32,32 @@ fi
 BENCHMARK_NAME="$1"
 shift
 
+normalize_benchmark_args() {
+    local benchmark_name="$1"
+    shift
+
+    local -a normalized=("$@")
+
+    case "$benchmark_name" in
+        bench_mult|bench_linear|bench_gate)
+            if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
+                normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
+            fi
+            ;;
+        bench_propagate)
+            if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
+                normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
+            fi
+
+            if [ ${#normalized[@]} -gt 2 ] && [ "${normalized[2]}" != "--num-groups" ] && [[ ! "${normalized[2]}" =~ ^-- ]]; then
+                normalized=("${normalized[@]:0:2}" "--num-groups" "${normalized[2]}" "${normalized[@]:3}")
+            fi
+            ;;
+    esac
+
+    printf '%s\n' "${normalized[@]}"
+}
+
 # --------------------------------------------------------------------
 # Locate benchmark binary
 # --------------------------------------------------------------------
@@ -65,7 +91,7 @@ if [ -z "$BENCHMARK_PATH" ]; then
     exit 1
 fi
 
-BENCHMARK_OPTS=("$@")
+mapfile -t BENCHMARK_OPTS < <(normalize_benchmark_args "$BENCHMARK_NAME" "$@")
 
 # --------------------------------------------------------------------
 # Defaults
@@ -131,7 +157,8 @@ timestamp=$(date +"%Y%m%d_%H%M%S")
 
 # You can override base results directory:
 #   RESULTS_DIR=/tmp/my_results ./run.sh bench_propagate ...
-RESULTS_BASE="${RESULTS_DIR:-$PWD/Results}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESULTS_BASE="${RESULTS_DIR:-$SCRIPT_DIR/benchmark/Results}"
 
 logdir="$RESULTS_BASE/$BENCHMARK_NAME/vec_${vec_size}/groups_${num_groups}/$timestamp"
 mkdir -p "$logdir"
