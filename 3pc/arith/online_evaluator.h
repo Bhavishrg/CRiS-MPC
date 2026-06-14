@@ -209,6 +209,7 @@ class OnlineEvaluator {
     std::array<std::vector<const FIn1Gate*>, 3> recp_by_target{};
     std::vector<const FIn2Gate*> mul_gates;
     std::vector<const ShuffleGate*> shuffle_gates;
+    std::vector<const UnshuffleGate*> unshuffle_gates;
 
     inp_by_owner[0].reserve(level.size());
     inp_by_owner[1].reserve(level.size());
@@ -219,6 +220,7 @@ class OnlineEvaluator {
     recp_by_target[2].reserve(level.size());
     mul_gates.reserve(level.size());
     shuffle_gates.reserve(level.size());
+    unshuffle_gates.reserve(level.size());
 
     for (const auto& gp : level) {
       switch (gp->type) {
@@ -243,6 +245,9 @@ class OnlineEvaluator {
         case GateType::kShuffle:
           shuffle_gates.push_back(static_cast<const ShuffleGate*>(gp.get()));
           break;
+        case GateType::kUnshuffle:
+          unshuffle_gates.push_back(static_cast<const UnshuffleGate*>(gp.get()));
+          break;
         default:
           break;
       }
@@ -256,6 +261,7 @@ class OnlineEvaluator {
     batchRecP(recp_by_target);
     batchMul(mul_gates);
     batchShuffle(shuffle_gates);
+    batchUnshuffle(unshuffle_gates);
 
     for (const auto& local_level : local_sublevels)
       evalLocalSublevel(local_level);
@@ -594,6 +600,29 @@ class OnlineEvaluator {
     return out;
   }
 
+  // applyInvPerm — inverse of applyPerm for the same pull-permutation vector.
+  //
+  // If applyPerm gives
+  //
+  //   out[j] = v[perm[j]],
+  //
+  // then applyInvPerm gives
+  //
+  //   out[perm[j]] = v[j].
+  //
+  // This is the operation needed by Unshuffle, because unshuffle applies the
+  // inverse of each cached pair permutation.
+  static std::vector<T> applyInvPerm(const std::vector<size_t>& perm,
+                                     const std::vector<T>& v) {
+    std::vector<T> out(perm.size());
+    #pragma omp parallel for if(perm.size() >= kParallelInteractiveThreshold) schedule(static)
+    for (long long jj = 0; jj < static_cast<long long>(perm.size()); ++jj) {
+      const size_t j = static_cast<size_t>(jj);
+      out[perm[j]] = v[j];
+    }
+    return out;
+  }
+
   // ── batchShuffle: all kShuffle gates at this level ──
   //
   // All gates' round-1 sends are staged before the first flush.
@@ -842,6 +871,304 @@ class OnlineEvaluator {
           wires_[g.outs[j]] = RSSShare<T>(m.B_tilde[j], C_tilde[j], my_pid_);
         else
           wires_[g.outs[j]] = RSSShare<T>(C_tilde[j], m.A_tilde[j], my_pid_);
+      }
+    }
+  }  // end batchShuffle
+
+
+  // ── batchUnshuffle: all kUnshuffle gates at this level ───────────────────
+  //
+  // kUnshuffle applies the inverse of the hidden grouped shuffle permutation.
+  // If the cached shuffle group represents
+  //
+  //   pi = pi_23 o pi_31 o pi_12,
+  //
+  // then this gate applies
+  //
+  //   pi^{-1} = pi_12^{-1} o pi_31^{-1} o pi_23^{-1}.
+  //
+  // This is the 2-round role-reversed counterpart of the shuffle protocol:
+  //
+  //   actual P2 acts like S1 in the shuffle table,
+  //   actual P1 remains the middle party S2,
+  //   actual P0 acts like S3.
+  //
+  // The two additive streams are split across the first inverse pair (P1,P2):
+  //
+  //   P2 starts with  C + A + Z23,
+  //   P1 starts with  B     - Z23.
+  //
+  // Their sum is the input value.  Both streams are then pushed through the
+  // inverse pair permutations in reverse order:
+  //
+  //   pi_23^{-1}, then pi_31^{-1}, then pi_12^{-1}.
+  //
+  // Communication pattern, exactly 2 rounds / 4 logical messages:
+  //
+  //   Round 1:
+  //     P2 -> P1 : X2 = pi_31^{-1}( pi_23^{-1}(C+A+Z23) + Z31 )
+  //     P1 -> P0 : Y1 = pi_23^{-1}( B - Z23 )
+  //
+  //   Round 2:
+  //     P1 -> P0 : D1 = pi_12^{-1}( X2 + Z12 ) - C_tilde
+  //     P0 -> P1 : D2 = pi_12^{-1}( pi_31^{-1}(Y1-Z31) - Z12 ) - A_tilde
+  //
+  // After round 2, both P0 and P1 compute
+  //
+  //   B_tilde = D1 + D2,
+  //
+  // and the normal RSS output shares are
+  //
+  //   P0 : (A_tilde, B_tilde)
+  //   P1 : (B_tilde, C_tilde)
+  //   P2 : (C_tilde, A_tilde).
+  //
+  // Fresh output masks:
+  //   A_tilde is sampled by pair (P2,P0), i.e. pi_31 pair.
+  //   C_tilde is sampled by pair (P1,P2), i.e. pi_23 pair.
+  //   B_tilde is derived from D1+D2, so there is no separate PRG mask for it.
+  void batchUnshuffle(const std::vector<const UnshuffleGate*>& gates) {
+    if (gates.empty()) return;
+    const size_t G = gates.size();
+
+    struct Mat {
+      size_t n{0};
+
+      // Cached pairwise pull permutations created by the matching grouped
+      // shuffle gate.  applyInvPerm applies the inverse of these permutations.
+      const std::vector<size_t>* perm_12{nullptr};
+      const std::vector<size_t>* perm_23{nullptr};
+      const std::vector<size_t>* perm_31{nullptr};
+
+      // Reverse-protocol masks shared by the corresponding pairs.
+      std::vector<T> Z12, Z23, Z31;
+
+      // Fresh output masks in normal RSS order.
+      std::vector<T> A_tilde;  // shared by P0/P2
+      std::vector<T> C_tilde;  // shared by P1/P2
+
+      // Round-1 / round-2 intermediates.
+      std::vector<T> X2;       // P2 -> P1
+      std::vector<T> Y1;       // P1 -> P0
+      std::vector<T> D1;       // P1 -> P0, contribution to B_tilde
+      std::vector<T> D2;       // P0 -> P1, contribution to B_tilde
+    };
+
+    std::vector<Mat> mats(G);
+
+    // ------------------------------------------------------------------
+    // Phase 0: look up cached permutations and sample fresh masks.
+    // ------------------------------------------------------------------
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      if (g.perm_group_id < 0) {
+        throw std::runtime_error(
+            "OnlineEvaluator: kUnshuffle requires non-negative perm_group_id");
+      }
+
+      Mat& m = mats[gi];
+      m.n = g.ins.size();
+      const size_t n = m.n;
+
+      auto it = perm_cache_.find(g.perm_group_id);
+      if (it == perm_cache_.end()) {
+        throw std::runtime_error(
+            "OnlineEvaluator: kUnshuffle used before matching kShuffle for perm_group_id " +
+            std::to_string(g.perm_group_id));
+      }
+      checkCachedPermSize(g.perm_group_id, it->second, n);
+
+      m.perm_12 = &it->second.perm_12;
+      m.perm_23 = &it->second.perm_23;
+      m.perm_31 = &it->second.perm_31;
+
+      m.Z12.resize(n);
+      m.Z23.resize(n);
+      m.Z31.resize(n);
+      m.A_tilde.resize(n);
+      m.C_tilde.resize(n);
+      m.X2.resize(n);
+      m.Y1.resize(n);
+      m.D1.resize(n);
+      m.D2.resize(n);
+
+      // Pair 12: P0/P1 share Z12.
+      if (my_pid_ == 0) {
+        prg_.next_next<T>(m.Z12.data(), n);
+      } else if (my_pid_ == 1) {
+        prg_.next_prev<T>(m.Z12.data(), n);
+      }
+
+      // Pair 23: P1/P2 share Z23 and fresh output mask C_tilde.
+      if (my_pid_ == 1) {
+        prg_.next_next<T>(m.Z23.data(), n);
+        prg_.next_next<T>(m.C_tilde.data(), n);
+      } else if (my_pid_ == 2) {
+        prg_.next_prev<T>(m.Z23.data(), n);
+        prg_.next_prev<T>(m.C_tilde.data(), n);
+      }
+
+      // Pair 31: P2/P0 share Z31 and fresh output mask A_tilde.
+      if (my_pid_ == 2) {
+        prg_.next_next<T>(m.Z31.data(), n);
+        prg_.next_next<T>(m.A_tilde.data(), n);
+      } else if (my_pid_ == 0) {
+        prg_.next_prev<T>(m.Z31.data(), n);
+        prg_.next_prev<T>(m.A_tilde.data(), n);
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // Round 1 sends.
+    // ------------------------------------------------------------------
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      Mat& m = mats[gi];
+      const size_t n = m.n;
+
+      if (my_pid_ == 2) {
+        // P2 holds RSS components (C,A).  Start the first stream as
+        // C + A + Z23, apply pi_23^{-1}, mask for the next pair, then apply
+        // pi_31^{-1}.  The result is sent to P1 for the final pi_12^{-1}.
+        std::vector<T> S0(n);
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          const auto& sh = wires_[g.ins[i]];
+          S0[i] = sh.left() + sh.right() + m.Z23[i];
+        }
+
+        std::vector<T> S1 = applyInvPerm(*m.perm_23, S0);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          S1[i] += m.Z31[i];
+        }
+
+        m.X2 = applyInvPerm(*m.perm_31, S1);
+        net_.send_ring<T>(m.X2.data(), n, 1);  // P2 -> P1
+      }
+
+      if (my_pid_ == 1) {
+        // P1 holds RSS components (B,C).  For the second stream we need only
+        // B, so use the left component and subtract the pair-23 mask.
+        std::vector<T> T0(n);
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          const auto& sh = wires_[g.ins[i]];
+          T0[i] = sh.left() - m.Z23[i];
+        }
+
+        m.Y1 = applyInvPerm(*m.perm_23, T0);
+        net_.send_ring<T>(m.Y1.data(), n, 0);  // P1 -> P0
+      }
+    }
+    net_.flush();  // ══ end of round 1 ══════════════════════════════════════
+
+    // ------------------------------------------------------------------
+    // Round 1 receives + round 2 sends.
+    // ------------------------------------------------------------------
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      Mat& m = mats[gi];
+      const size_t n = m.n;
+
+      if (my_pid_ == 1) {
+        // Finish the first stream:
+        //   X3 = pi_12^{-1}(X2 + Z12).
+        // Then send D1 = X3 - C_tilde to P0.  D1 is one additive contribution
+        // to the middle output share B_tilde.
+        net_.recv_ring<T>(m.X2.data(), n, 2);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.X2[i] += m.Z12[i];
+        }
+
+        std::vector<T> X3 = applyInvPerm(*m.perm_12, m.X2);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.D1[i] = X3[i] - m.C_tilde[i];
+        }
+
+        net_.send_ring<T>(m.D1.data(), n, 0);  // P1 -> P0
+      }
+
+      if (my_pid_ == 0) {
+        // Finish the second stream:
+        //   Y2 = pi_31^{-1}(Y1 - Z31),
+        //   Y3 = pi_12^{-1}(Y2 - Z12).
+        // Then send D2 = Y3 - A_tilde to P1.  D2 is the second additive
+        // contribution to B_tilde.
+        net_.recv_ring<T>(m.Y1.data(), n, 1);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.Y1[i] -= m.Z31[i];
+        }
+
+        std::vector<T> Y2 = applyInvPerm(*m.perm_31, m.Y1);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          Y2[i] -= m.Z12[i];
+        }
+
+        std::vector<T> Y3 = applyInvPerm(*m.perm_12, Y2);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.D2[i] = Y3[i] - m.A_tilde[i];
+        }
+
+        net_.send_ring<T>(m.D2.data(), n, 1);  // P0 -> P1
+      }
+    }
+    net_.flush();  // ══ end of round 2 ══════════════════════════════════════
+
+    // ------------------------------------------------------------------
+    // Round 2 receives + write final RSS output wires.
+    // No further communication is performed here.
+    // ------------------------------------------------------------------
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      Mat& m = mats[gi];
+      const size_t n = m.n;
+
+      std::vector<T> B_tilde(n);
+
+      if (my_pid_ == 0) {
+        net_.recv_ring<T>(m.D1.data(), n, 1);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          B_tilde[i] = m.D1[i] + m.D2[i];
+          wires_[g.outs[i]] = RSSShare<T>(m.A_tilde[i], B_tilde[i], my_pid_);
+        }
+      } else if (my_pid_ == 1) {
+        net_.recv_ring<T>(m.D2.data(), n, 0);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          B_tilde[i] = m.D1[i] + m.D2[i];
+          wires_[g.outs[i]] = RSSShare<T>(B_tilde[i], m.C_tilde[i], my_pid_);
+        }
+      } else {
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          wires_[g.outs[i]] = RSSShare<T>(m.C_tilde[i], m.A_tilde[i], my_pid_);
+        }
       }
     }
   }

@@ -184,6 +184,38 @@ class Circuit {
     return outs;
   }
 
+  // ── Unshuffle gate: kUnshuffle ───────────────────────────────────────────
+
+  /**
+   * Secretly apply the inverse of the hidden permutation stored under
+   * `perm_group_id`.
+   *
+   * If the corresponding grouped shuffle represents
+   *
+   *   pi = pi_23 o pi_31 o pi_12,
+   *
+   * then this gate applies
+   *
+   *   pi^{-1} = pi_12^{-1} o pi_31^{-1} o pi_23^{-1}.
+   *
+   * The group id must be explicit and non-negative.  During evaluation the
+   * group must already be present in the evaluator's permutation cache, which
+   * means a kShuffle gate with the same group id must have been evaluated
+   * earlier.  Fresh masks are still sampled for every unshuffle gate.
+   */
+  std::vector<wire_t> addUnshuffleGate(const std::vector<wire_t>& ins,
+                                        int perm_group_id) {
+    if (ins.empty())
+      throw std::invalid_argument("addUnshuffleGate: ins must be non-empty");
+    if (perm_group_id < 0)
+      throw std::invalid_argument("addUnshuffleGate: perm_group_id must be non-negative");
+    for (wire_t w : ins) checkWire(w);
+    std::vector<wire_t> outs(ins.size());
+    for (wire_t& w : outs) w = num_wires_++;
+    gates_.push_back(std::make_shared<UnshuffleGate>(ins, outs, perm_group_id));
+    return outs;
+  }
+
   // ── LocalPerm gate: kLocalPerm ────────────────────────────────────────
 
   /**
@@ -215,6 +247,17 @@ class Circuit {
   void setAsOutput(wire_t w) {
     checkWire(w);
     outputs_.push_back(w);
+  }
+
+  /**
+   * Return a fresh shuffle permutation-group id.
+   *
+   * Gates using the same non-negative id reuse the same hidden random
+   * permutation.  This helper makes reuse explicit inside subcircuits, and
+   * avoids accidental reuse across independent protocol steps.
+   */
+  int freshPermGroupId() const {
+    return static_cast<int>(gates_.size());
   }
 
   // ── Sub Circuits ────────────────────────────────────────────────────────
@@ -326,6 +369,74 @@ class Circuit {
     }
 
     return shuffled_payloads;
+  }
+
+
+
+
+  /**
+  * SUBCIRCUIT: UnshuffleWithPayload
+  *
+  * Applies the inverse of the same hidden grouped permutation to several
+  * aligned payload vectors.
+  *
+  * Input:
+  *   payloads[p][i] = i-th element of payload vector p after a shuffle by
+  *                    perm_group_id.
+  *
+  * Output:
+  *   unshuffled_payloads[p] = payloads[p] after applying
+  *                            pi^{-1}, where
+  *
+  *       pi = pi_23 o pi_31 o pi_12
+  *
+  *   is the hidden permutation stored under perm_group_id.
+  *
+  * Important:
+  *   This is the inverse counterpart of addSubCircShuffleWithPayload.  The
+  *   evaluator expects that the same perm_group_id was used by an earlier
+  *   kShuffle gate, so that the pairwise permutations are cached.
+  */
+  std::vector<std::vector<wire_t>> addSubCircUnshuffleWithPayload(
+      const std::vector<std::vector<wire_t>>& payloads,
+      int perm_group_id) {
+
+    if (perm_group_id < 0) {
+      throw std::invalid_argument(
+          "addSubCircUnshuffleWithPayload: perm_group_id must be non-negative");
+    }
+
+    if (payloads.empty()) {
+      throw std::invalid_argument(
+          "addSubCircUnshuffleWithPayload: at least one payload vector is required");
+    }
+
+    const size_t vec_size = payloads[0].size();
+
+    if (vec_size == 0) {
+      throw std::invalid_argument(
+          "addSubCircUnshuffleWithPayload: payload vectors must be non-empty");
+    }
+
+    for (size_t p = 0; p < payloads.size(); ++p) {
+      if (payloads[p].size() != vec_size) {
+        throw std::invalid_argument(
+            "addSubCircUnshuffleWithPayload: all payload vectors must have same size");
+      }
+
+      for (wire_t w : payloads[p]) {
+        checkWire(w);
+      }
+    }
+
+    std::vector<std::vector<wire_t>> unshuffled_payloads;
+    unshuffled_payloads.reserve(payloads.size());
+
+    for (const auto& payload : payloads) {
+      unshuffled_payloads.push_back(addUnshuffleGate(payload, perm_group_id));
+    }
+
+    return unshuffled_payloads;
   }
 
 
@@ -612,6 +723,400 @@ class Circuit {
     return gathered;
   }
 
+
+  /**
+  * SUBCIRCUIT: GenBitPerm
+  *
+  * Generate the stable one-bit sorting permutation for a secret-shared bit
+  * vector.
+  *
+  * Input:
+  *   bit_vector[i] is the i-th key bit and must be in {0,1}.
+  *
+  * Output:
+  *   rho[i] is a secret-shared destination label in [0, n-1].
+  *
+  * Semantics:
+  *   Applying rho to a payload with push semantics
+  *
+  *       out[rho[i]] = payload[i]
+  *
+  *   stably partitions the payload so that all 0-bit entries appear before
+  *   all 1-bit entries.  This is the 0-based version of Protocol 4.1
+  *   GenBitPerm from Asharov et al., ePrint 2022/1595.
+  *
+  * Logic:
+  *   1. Compute f0[i] = 1 - bit[i] and f1[i] = bit[i].
+  *   2. Compute prefix counts s0[i] = number of zeros up to i.
+  *   3. Compute prefix counts s1[i] = total number of zeros
+  *                                   + number of ones up to i.
+  *   4. Select the proper 1-based destination:
+  *
+  *        rho1[i] = s0[i] + bit[i] * (s1[i] - s0[i]).
+  *
+  *      If bit[i] = 0, this gives the stable zero-position.
+  *      If bit[i] = 1, this gives the stable one-position.
+  *   5. Convert rho1 from 1-based to 0-based labels.
+  */
+  std::vector<wire_t> addGenBitPermSubcircuit(
+      const std::vector<wire_t>& bit_vector) {
+
+    const size_t n = bit_vector.size();
+
+    if (n == 0) {
+      throw std::invalid_argument(
+          "addGenBitPermSubcircuit: bit_vector must be non-empty");
+    }
+
+    for (wire_t w : bit_vector) {
+      checkWire(w);
+    }
+
+    // Create real constant wires from the circuit.
+    wire_t zero_wire = addGate(GateType::kSub, bit_vector[0], bit_vector[0]);
+    wire_t one_wire  = addCGate(GateType::kCAdd, zero_wire, static_cast<T>(1));
+
+    // ----------------------------------------------------------------------
+    // Step 1: Build indicator vectors for the two buckets.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> f0(n);
+    std::vector<wire_t> f1(n);
+
+    for (size_t i = 0; i < n; ++i) {
+      // f0[i] = 1 - bit[i].
+      f0[i] = addGate(GateType::kSub, one_wire, bit_vector[i]);
+
+      // f1[i] = bit[i].
+      f1[i] = bit_vector[i];
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 2: Prefix count of zeros.
+    //
+    // s0[i] is the 1-based stable destination of item i if bit[i] = 0.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> s0(n);
+    s0[0] = f0[0];
+
+    for (size_t i = 1; i < n; ++i) {
+      s0[i] = addGate(GateType::kAdd, s0[i - 1], f0[i]);
+    }
+
+    wire_t total_zeros = s0[n - 1];
+
+    // ----------------------------------------------------------------------
+    // Step 3: Prefix count of ones, offset by total number of zeros.
+    //
+    // s1[i] is the 1-based stable destination of item i if bit[i] = 1.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> prefix_ones(n);
+    std::vector<wire_t> s1(n);
+
+    prefix_ones[0] = f1[0];
+    s1[0] = addGate(GateType::kAdd, total_zeros, prefix_ones[0]);
+
+    for (size_t i = 1; i < n; ++i) {
+      prefix_ones[i] = addGate(GateType::kAdd, prefix_ones[i - 1], f1[i]);
+      s1[i] = addGate(GateType::kAdd, total_zeros, prefix_ones[i]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 4: Secretly select the zero-destination or one-destination.
+    //
+    // rho1[i] = s0[i] + bit[i] * (s1[i] - s0[i]).
+    //
+    // This is the only nonlinear step of GenBitPerm.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> rho(n);
+
+    for (size_t i = 0; i < n; ++i) {
+      wire_t diff     = addGate(GateType::kSub, s1[i], s0[i]);
+      wire_t selected = addGate(GateType::kMul, bit_vector[i], diff);
+      wire_t rho1     = addGate(GateType::kAdd, s0[i], selected);
+
+      // Step 5: convert 1-based destination to 0-based destination.
+      rho[i] = addCGate(GateType::kCSub, rho1, static_cast<T>(1));
+    }
+
+    return rho;
+  }
+
+
+  /**
+  * SUBCIRCUIT: ApplyPerm
+  *
+  * Apply a secret-shared destination-label permutation to a secret-shared
+  * payload vector.
+  *
+  * Input:
+  *   secret_perm[i] is a secret-shared destination label in [0, n-1].
+  *   payload[i]     is the value attached to source position i.
+  *   perm_group_id  identifies the fresh random shuffle used to mask both
+  *                  vectors.
+  *
+  * Output:
+  *   result[secret_perm[i]] = payload[i].
+  *
+  * Security / leakage:
+  *   The secret permutation is not opened directly.  The circuit only opens
+  *   pi(secret_perm), where pi is a hidden random shuffle.  Since pi is random,
+  *   the opened labels are a one-time randomized view of secret_perm.
+  *
+  * Logic:
+  *   1. Shuffle secret_perm and payload using the same hidden random pi.
+  *   2. Reconstruct the shuffled permutation labels.
+  *   3. Locally push the shuffled payload into the reconstructed labels.
+  */
+  std::vector<wire_t> addApplyPermSubcircuit(
+      const std::vector<wire_t>& secret_perm,
+      const std::vector<wire_t>& payload,
+      int perm_group_id) {
+
+    const size_t n = secret_perm.size();
+
+    if (n == 0) {
+      throw std::invalid_argument(
+          "addApplyPermSubcircuit: vectors must be non-empty");
+    }
+
+    if (payload.size() != n) {
+      throw std::invalid_argument(
+          "addApplyPermSubcircuit: secret_perm and payload must have same size");
+    }
+
+    if (perm_group_id < 0) {
+      throw std::invalid_argument(
+          "addApplyPermSubcircuit: perm_group_id must be non-negative");
+    }
+
+    for (wire_t w : secret_perm) checkWire(w);
+    for (wire_t w : payload)     checkWire(w);
+
+    // ----------------------------------------------------------------------
+    // Step 1: Mask both vectors by the same hidden random permutation pi.
+    //
+    // Reusing perm_group_id is essential: the shuffled permutation labels and
+    // shuffled payload values must remain row-aligned.
+    // ----------------------------------------------------------------------
+    std::vector<std::vector<wire_t>> shuffled =
+        addSubCircShuffleWithPayload({secret_perm, payload}, perm_group_id);
+
+    const std::vector<wire_t>& shuffled_perm    = shuffled[0];
+    const std::vector<wire_t>& shuffled_payload = shuffled[1];
+
+    // ----------------------------------------------------------------------
+    // Step 2: Open the masked destination labels.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> public_masked_perm(n);
+    for (size_t i = 0; i < n; ++i) {
+      public_masked_perm[i] = addRecGate(shuffled_perm[i]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 3: Push the shuffled payload according to the opened labels.
+    //
+    // Because shuffled_perm and shuffled_payload were masked by the same pi,
+    // this yields result[secret_perm[i]] = payload[i].
+    // ----------------------------------------------------------------------
+    return addLocalPermGate(shuffled_payload, public_masked_perm, true);
+  }
+
+
+  /**
+  * SUBCIRCUIT: ComposePerm
+  *
+  * Compose two secret-shared destination-label permutations.
+  *
+  * Input:
+  *   secret_sigma[i] is the destination of source position i under the
+  *                   already accumulated permutation sigma.
+  *
+  *   secret_rho[j]   is the destination of current position j under the new
+  *                   stable one-bit permutation rho.
+  *
+  * Output:
+  *   tau[i] = secret_rho[ secret_sigma[i] ].
+  *
+  * Therefore applying tau to a payload is equivalent to first applying sigma
+  * and then applying rho:
+  *
+  *   tau = rho o sigma.
+  *
+  * Logic: Protocol 4.3 / Compose with an explicit Unshuffle gate.
+  *
+  *   1. Shuffle sigma using a fresh hidden pi and open pi(sigma).
+  *   2. Locally compute gamma[j] = rho[pi(sigma)[j]].
+  *      Since pi(sigma)[j] = sigma[pi[j]], this means
+  *
+  *        gamma[j] = rho[sigma[pi[j]]] = tau[pi[j]].
+  *
+  *   3. Unshuffle gamma with the same pi.  The unshuffle applies pi^{-1},
+  *      giving tau.
+  */
+  std::vector<wire_t> addComposePermSubcircuit(
+      const std::vector<wire_t>& secret_sigma,
+      const std::vector<wire_t>& secret_rho,
+      int perm_group_id) {
+
+    const size_t n = secret_sigma.size();
+
+    if (n == 0) {
+      throw std::invalid_argument(
+          "addComposePermSubcircuit: permutations must be non-empty");
+    }
+
+    if (secret_rho.size() != n) {
+      throw std::invalid_argument(
+          "addComposePermSubcircuit: permutations must have same size");
+    }
+
+    if (perm_group_id < 0) {
+      throw std::invalid_argument(
+          "addComposePermSubcircuit: perm_group_id must be non-negative");
+    }
+
+    for (wire_t w : secret_sigma) checkWire(w);
+    for (wire_t w : secret_rho)   checkWire(w);
+
+    // ----------------------------------------------------------------------
+    // Step 1: Shuffle sigma with the hidden random permutation pi.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> shuffled_sigma =
+        addShuffleGate(secret_sigma, perm_group_id);
+
+    // ----------------------------------------------------------------------
+    // Step 2: Open the masked sigma labels.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> public_masked_sigma(n);
+    for (size_t i = 0; i < n; ++i) {
+      public_masked_sigma[i] = addRecGate(shuffled_sigma[i]);
+    }
+
+    // ----------------------------------------------------------------------
+    // Step 3: Locally pull rho through the opened masked labels.
+    //
+    // gamma[j] = rho[ public_masked_sigma[j] ] = tau[pi[j]].
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> gamma =
+        addLocalPermGate(secret_rho, public_masked_sigma, false);
+
+    // ----------------------------------------------------------------------
+    // Step 4: Apply pi^{-1} with a real unshuffle gate.
+    // ----------------------------------------------------------------------
+    return addUnshuffleGate(gamma, perm_group_id);
+  }
+
+
+  /**
+  * SUBCIRCUIT: Sort / GenPerm
+  *
+  * Generate the stable sorting permutation for bit-decomposed keys using the
+  * paper-style GenPerm logic.
+  *
+  * Input layout:
+  *   wires is a flattened matrix with vec_size records and input_size bits
+  *   per record:
+  *
+  *     record 0: wires[0], wires[1], ..., wires[input_size - 1]
+  *     record 1: wires[input_size], ..., wires[2*input_size - 1]
+  *     ...
+  *
+  * Bit order:
+  *   The routine follows the earlier codebase convention: wires[input_size-1]
+  *   is the least-significant bit and wires[0] is the most-significant bit.
+  *   Therefore the loop processes columns from input_size-1 down to 0.
+  *
+  * Output:
+  *   A secret-shared destination-label permutation sigma such that applying
+  *   sigma to a payload gives the stable sorted payload:
+  *
+  *     sorted[sigma[i]] = payload[i].
+  *
+  * Logic: Protocol 4.4 / GenPerm.
+  *
+  *   1. Generate rho for the least-significant bit using GenBitPerm.
+  *   2. Let sigma = rho.
+  *   3. For each remaining bit, from less significant to more significant:
+  *      a. Apply the accumulated secret permutation sigma only to this bit.
+  *      b. Generate rho for the permuted bit column.
+  *      c. Compose sigma = rho o sigma.
+  *   4. Return sigma.
+  */
+  std::vector<wire_t> addSortSubcircuit(
+      const std::vector<wire_t>& wires,
+      size_t vec_size) {
+
+    if (vec_size == 0) {
+      throw std::invalid_argument(
+          "addSortSubcircuit: vec_size must be non-zero");
+    }
+
+    if (wires.empty()) {
+      throw std::invalid_argument(
+          "addSortSubcircuit: wires must be non-empty");
+    }
+
+    if (wires.size() % vec_size != 0) {
+      throw std::invalid_argument(
+          "addSortSubcircuit: wires.size() must be divisible by vec_size");
+    }
+
+    const size_t input_size = wires.size() / vec_size;
+
+    if (input_size == 0) {
+      throw std::invalid_argument(
+          "addSortSubcircuit: input_size must be non-zero");
+    }
+
+    for (wire_t w : wires) {
+      checkWire(w);
+    }
+
+    auto get_bit_column = [&](size_t bit) {
+      std::vector<wire_t> column(vec_size);
+      for (size_t i = 0; i < vec_size; ++i) {
+        column[i] = wires[bit + i * input_size];
+      }
+      return column;
+    };
+
+    // ----------------------------------------------------------------------
+    // Step 1: First radix step on the least-significant bit.
+    // ----------------------------------------------------------------------
+    std::vector<wire_t> first_bit = get_bit_column(input_size - 1);
+    std::vector<wire_t> sigma = addGenBitPermSubcircuit(first_bit);
+
+    // ----------------------------------------------------------------------
+    // Step 2: Remaining radix steps.
+    // ----------------------------------------------------------------------
+    for (int bit = static_cast<int>(input_size) - 2; bit >= 0; --bit) {
+      // a. Extract the next more-significant bit column.
+      std::vector<wire_t> next_bit =
+          get_bit_column(static_cast<size_t>(bit));
+
+      // b. Apply the accumulated secret permutation only to this bit column.
+      std::vector<wire_t> permuted_next_bit =
+          addApplyPermSubcircuit(
+              sigma,
+              next_bit,
+              freshPermGroupId());
+
+      // c. Generate the stable refinement for this bit.
+      std::vector<wire_t> rho =
+          addGenBitPermSubcircuit(permuted_next_bit);
+
+      // d. Compose the accumulated permutation with the new refinement.
+      sigma =
+          addComposePermSubcircuit(
+              sigma,
+              rho,
+              freshPermGroupId());
+    }
+
+    return sigma;
+  }
+
+
   // ── Accessors ────────────────────────────────────────────────────────────
 
   size_t numWires() const { return num_wires_; }
@@ -664,6 +1169,12 @@ class Circuit {
           wdepth[w] = d;
           wlocal_rank[w] = 0;
         }
+      } else if (gp->type == GateType::kUnshuffle) {
+        const auto& ug = static_cast<const UnshuffleGate&>(*gp);
+        for (wire_t w : ug.outs) {
+          wdepth[w] = d;
+          wlocal_rank[w] = 0;
+        }
       } else if (gp->type == GateType::kLocalPerm) {
         const auto& lg = static_cast<const LocalPermGate&>(*gp);
         for (wire_t w : lg.outs) {
@@ -713,7 +1224,8 @@ class Circuit {
     return t == GateType::kMul     ||
            t == GateType::kRec     ||
            t == GateType::kRecP    ||
-           t == GateType::kShuffle;
+           t == GateType::kShuffle ||
+           t == GateType::kUnshuffle;
   }
 
   static bool isLocal(GateType t) {
@@ -793,10 +1305,19 @@ class Circuit {
       }
 
       case GateType::kShuffle: {
-        // 2 interactive rounds; depth = max(input depths) + 2
+        // 2 interactive rounds; depth = max(input depths) + 2.
         const auto& sg = static_cast<const ShuffleGate&>(g);
         size_t d = 0;
         for (wire_t w : sg.ins) d = std::max(d, wdepth[w]);
+        return d + 2;
+      }
+
+      case GateType::kUnshuffle: {
+        // Unshuffle is the role-reversed counterpart of Shuffle and uses
+        // exactly 2 interactive rounds.
+        const auto& ug = static_cast<const UnshuffleGate&>(g);
+        size_t d = 0;
+        for (wire_t w : ug.ins) d = std::max(d, wdepth[w]);
         return d + 2;
       }
 

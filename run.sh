@@ -22,6 +22,8 @@ if [ $# -lt 1 ]; then
     echo "Available benchmarks:"
     echo "  - bench_ops"
     echo "  - bench_propagate"
+    echo "  - bench_unshuffle"
+    echo "  - bench_sort"
     echo ""
     echo "Example:"
     echo "  $0 bench_propagate --vec-size 10 --num-groups 3"
@@ -39,9 +41,18 @@ normalize_benchmark_args() {
     local -a normalized=("$@")
 
     case "$benchmark_name" in
-        bench_mult|bench_linear|bench_gate)
+        bench_mult|bench_linear|bench_gate|bench_unshuffle)
             if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
                 normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
+            fi
+            ;;
+        bench_sort)
+            if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
+                normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
+            fi
+
+            if [ ${#normalized[@]} -gt 2 ] && [ "${normalized[2]}" != "--bit-width" ] && [[ ! "${normalized[2]}" =~ ^-- ]]; then
+                normalized=("${normalized[@]:0:2}" "--bit-width" "${normalized[2]}" "${normalized[@]:3}")
             fi
             ;;
         bench_propagate)
@@ -107,6 +118,7 @@ DEFAULT_PEER="127.0.0.1"
 
 vec_size="unspecified_vec_size"
 num_groups="unspecified_num_groups"
+bit_width="unspecified_bit_width"
 port="$DEFAULT_PORT"
 peer="$DEFAULT_PEER"
 
@@ -123,6 +135,11 @@ for ((i=0; i<${#BENCHMARK_OPTS[@]}; i++)); do
         --num-groups|-g)
             if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
                 num_groups="${BENCHMARK_OPTS[$((i+1))]}"
+            fi
+            ;;
+        --bit-width|-b)
+            if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
+                bit_width="${BENCHMARK_OPTS[$((i+1))]}"
             fi
             ;;
         --port)
@@ -160,7 +177,14 @@ timestamp=$(date +"%Y%m%d_%H%M%S")
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RESULTS_BASE="${RESULTS_DIR:-$SCRIPT_DIR/benchmark/Results}"
 
-logdir="$RESULTS_BASE/$BENCHMARK_NAME/vec_${vec_size}/groups_${num_groups}/$timestamp"
+case "$BENCHMARK_NAME" in
+    bench_sort)
+        logdir="$RESULTS_BASE/$BENCHMARK_NAME/vec_${vec_size}/bits_${bit_width}/$timestamp"
+        ;;
+    *)
+        logdir="$RESULTS_BASE/$BENCHMARK_NAME/vec_${vec_size}/groups_${num_groups}/$timestamp"
+        ;;
+esac
 mkdir -p "$logdir"
 
 echo "Running benchmark: $BENCHMARK_NAME"

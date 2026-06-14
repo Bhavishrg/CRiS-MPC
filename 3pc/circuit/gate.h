@@ -17,7 +17,8 @@ enum class GateType {
   kMul,     // interactive: out = in1 * in2  (RSS multiplication, 1 round)
   kRec,     // interactive: reconstruct — all parties learn the plaintext
   kRecP,    // interactive: reconstruct to `target` party only
-  kShuffle,    // interactive: secret-permute a vector of wires (2 rounds)
+  kShuffle,    // interactive: secretly apply grouped/random shuffle permutation
+  kUnshuffle,  // interactive: apply inverse of a grouped shuffle permutation
   kLocalPerm,   // local:       permute payload wires by index wires (no communication)
   kInvalid,
   NumGates
@@ -93,6 +94,35 @@ struct ShuffleGate : public Gate {
   ShuffleGate(std::vector<wire_t> ins, std::vector<wire_t> outs,
               int perm_group_id = -1)
       : Gate{GateType::kShuffle, outs.empty() ? 0 : outs[0]},
+        ins{std::move(ins)}, outs{std::move(outs)},
+        perm_group_id{perm_group_id} {}
+};
+
+
+// ── Unshuffle gate: kUnshuffle ───────────────────────────────────────────────
+// Applies the inverse of the hidden permutation identified by perm_group_id.
+//
+// The grouped shuffle protocol applies the effective permutation
+//
+//   pi = pi_23 o pi_31 o pi_12.
+//
+// This gate applies
+//
+//   pi^{-1} = pi_12^{-1} o pi_31^{-1} o pi_23^{-1}.
+//
+// The gate must use an explicit non-negative perm_group_id.  The evaluator
+// expects that a kShuffle gate with the same group id was evaluated earlier,
+// so that the pairwise permutations pi_12, pi_23, pi_31 are already cached.
+// Fresh output masks are still sampled independently for every kUnshuffle gate.
+struct UnshuffleGate : public Gate {
+  std::vector<wire_t> ins;
+  std::vector<wire_t> outs;
+  int perm_group_id{-1};
+
+  UnshuffleGate() : Gate{GateType::kUnshuffle, 0} {}
+  UnshuffleGate(std::vector<wire_t> ins, std::vector<wire_t> outs,
+                int perm_group_id)
+      : Gate{GateType::kUnshuffle, outs.empty() ? 0 : outs[0]},
         ins{std::move(ins)}, outs{std::move(outs)},
         perm_group_id{perm_group_id} {}
 };
