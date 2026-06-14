@@ -104,15 +104,21 @@ class OnlineEvaluator {
     if (n == 0) return result;
 
     std::vector<T> my_lefts(n), missing(n);
-    for (size_t i = 0; i < n; ++i)
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       my_lefts[i] = wires_.at(ws[i]).left();
+    }
 
     net_.send_ring<T>(my_lefts.data(), n, next_party(my_pid_));
     net_.flush();
     net_.recv_ring<T>(missing.data(), n, prev_party(my_pid_));
 
-    for (size_t i = 0; i < n; ++i)
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       result[i] = wires_.at(ws[i]).left() + wires_.at(ws[i]).right() + missing[i];
+    }
     return result;
   }
 
@@ -127,8 +133,11 @@ class OnlineEvaluator {
     // prev_party(target) sends its left_ shares to target.
     if (my_pid_ == prev_party(target)) {
       std::vector<T> to_send(n);
-      for (size_t i = 0; i < n; ++i)
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         to_send[i] = wires_.at(ws[i]).left();
+      }
       net_.send_ring<T>(to_send.data(), n, target);
     }
     net_.flush();
@@ -137,8 +146,11 @@ class OnlineEvaluator {
     if (my_pid_ == target) {
       std::vector<T> missing(n);
       net_.recv_ring<T>(missing.data(), n, prev_party(target));
-      for (size_t i = 0; i < n; ++i)
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         result[i] = wires_.at(ws[i]).left() + wires_.at(ws[i]).right() + missing[i];
+      }
     }
     return result;
   }
@@ -396,31 +408,38 @@ class OnlineEvaluator {
       const size_t n = og.size();
 
       if (my_pid_ == owner) {
-        // Sample s_{k+1} and s_{k+2}, compute s_k, send to prev_party.
-        std::vector<T> to_prv(n);
-        for (size_t i = 0; i < n; ++i) {
-          T s_nxt    = prg_.next_next<T>();
-          T s_global = prg_.next_global<T>();
-          T s_own    = getInput(og[i]->out) - s_nxt - s_global;
-          wires_[og[i]->out] = RSSShare<T>(s_own, s_nxt, my_pid_);
+        // PRG state is not thread-safe, so sample masks sequentially/batched.
+        // Input lookup/share arithmetic is then parallelized.
+        std::vector<T> s_nxt(n), s_global(n), to_prv(n);
+        prg_.next_next<T>(s_nxt.data(), n);
+        prg_.next_global<T>(s_global.data(), n);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          const T s_own = getInput(og[i]->out) - s_nxt[i] - s_global[i];
+          wires_[og[i]->out] = RSSShare<T>(s_own, s_nxt[i], my_pid_);
           to_prv[i] = s_own;
         }
         net_.send_ring<T>(to_prv.data(), n, prev_party(owner));
 
       } else if (my_pid_ == next_party(owner)) {
         // Derive both shares from PRGs — no communication needed.
-        for (size_t i = 0; i < n; ++i) {
-          T left  = prg_.next_prev<T>();    // s_{k+1} via prg shared with owner
-          T right = prg_.next_global<T>();  // s_{k+2}
-          wires_[og[i]->out] = RSSShare<T>(left, right, my_pid_);
+        std::vector<T> lefts(n), rights(n);
+        prg_.next_prev<T>(lefts.data(), n);    // s_{k+1} via PRG shared with owner
+        prg_.next_global<T>(rights.data(), n); // s_{k+2}
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          wires_[og[i]->out] = RSSShare<T>(lefts[i], rights[i], my_pid_);
         }
 
       } else {
         // Prev party: derive left = s_{k+2} from global PRG now (before flush),
         // store it; assign wire after receiving s_k from owner.
         prev_lefts[owner].resize(n);
-        for (size_t i = 0; i < n; ++i)
-          prev_lefts[owner][i] = prg_.next_global<T>();
+        prg_.next_global<T>(prev_lefts[owner].data(), n);
       }
     }
     net_.flush();
@@ -434,8 +453,11 @@ class OnlineEvaluator {
       std::vector<T> recv_buf(n);
       net_.recv_ring<T>(recv_buf.data(), n, owner);
 
-      for (size_t i = 0; i < n; ++i)
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         wires_[og[i]->out] = RSSShare<T>(prev_lefts[owner][i], recv_buf[i], my_pid_);
+      }
     }
   }
 
@@ -454,92 +476,92 @@ class OnlineEvaluator {
     if (gates.empty()) return;
     const size_t n = gates.size();
 
-    std::vector<T> z(n);
-    for (size_t i = 0; i < n; ++i) {
-      const auto& x = wires_[gates[i]->in1];
-      const auto& y = wires_[gates[i]->in2];
-      T h = x.left() * y.left()
-          + x.left() * y.right()
-          + x.right() * y.left();
-      T gamma_nxt = prg_.next_next<T>();
-      T gamma_prv = prg_.next_prev<T>();
-      z[i] = h + gamma_prv - gamma_nxt;
+    // PRG state is not thread-safe, so sample masks sequentially/batched first.
+    // The arithmetic using those masks is embarrassingly parallel.
+    std::vector<T> gamma_nxt(n), gamma_prv(n), z(n), z_nxt(n);
+    prg_.next_next<T>(gamma_nxt.data(), n);
+    prg_.next_prev<T>(gamma_prv.data(), n);
+
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const auto* gate = gates[i];
+      const auto& x = wires_[gate->in1];
+      const auto& y = wires_[gate->in2];
+      const T xl = x.left();
+      const T xr = x.right();
+      const T yl = y.left();
+      const T yr = y.right();
+
+      const T h = xl * yl + xl * yr + xr * yl;
+      z[i] = h + gamma_prv[i] - gamma_nxt[i];
     }
 
-    // Send z[0..n-1] to prev_party; receive z_nxt[0..n-1] from next_party.
-    std::vector<T> z_nxt(n);
+    // Keep communication single-threaded and batched.
     net_.send_ring<T>(z.data(), n, prev_party(my_pid_));
     net_.flush();
     net_.recv_ring<T>(z_nxt.data(), n, next_party(my_pid_));
 
-    for (size_t i = 0; i < n; ++i)
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       wires_[gates[i]->out] = RSSShare<T>(z[i], z_nxt[i], my_pid_);
+    }
   }
 
   
 
   // ── Batch: kRec — all parties reconstruct ────────────────────────────────
   //
-  // P_i sends its left_ (= s_i) to next_party.
-  // P_i receives the missing sub-share (s_{i+2}) from prev_party.
-  // Result is stored as (plain, 0, 0).
+  // Delegate the communication to reconstruct(ws), then store each plaintext as
+  // a public/plain wire represented by (plain, 0).
   void batchRec(const std::vector<const FIn1Gate*>& gates) {
     if (gates.empty()) return;
     const size_t n = gates.size();
 
-    std::vector<T> my_lefts(n), missing(n);
-    for (size_t i = 0; i < n; ++i)
-      my_lefts[i] = wires_[gates[i]->in].left();
+    std::vector<wire_t> inputs(n);
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      inputs[i] = gates[i]->in;
+    }
 
-    net_.send_ring<T>(my_lefts.data(), n, next_party(my_pid_));
-    net_.flush();
-    net_.recv_ring<T>(missing.data(), n, prev_party(my_pid_));
+    const std::vector<T> plains = reconstruct(inputs);
 
-    for (size_t i = 0; i < n; ++i) {
-      const auto& s = wires_[gates[i]->in];
-      T plain = s.left() + s.right() + missing[i];
-      // Store as (plain, 0) — the "right" slot is unused after reconstruction.
-      wires_[gates[i]->out] = RSSShare<T>(plain, T{}, my_pid_);
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      wires_[gates[i]->out] = RSSShare<T>(plains[i], T{}, my_pid_);
     }
   }
 
   // ── Batch: kRecP — targeted reconstruction ───────────────────────────────
+  //
+  // Delegate the communication to reconstructTo(ws, target).  All parties call
+  // reconstructTo for every non-empty target batch, so send/recv ordering stays
+  // identical across parties.  Only the target receives plaintexts; all other
+  // parties store zero shares on the output wires.
   void batchRecP(const std::array<std::vector<const FIn1Gate*>, 3>& by_target) {
-    // Phase 1: send left_ for gates where I am prev_party(target)
     for (int target = 0; target < 3; ++target) {
       const auto& tg = by_target[target];
-      if (tg.empty() || my_pid_ != prev_party(target)) continue;
+      if (tg.empty()) continue;
 
       const size_t n = tg.size();
-      std::vector<T> to_send(n);
-      for (size_t i = 0; i < n; ++i)
-        to_send[i] = wires_[tg[i]->in].left();
-      net_.send_ring<T>(to_send.data(), n, target);
-    }
-    net_.flush();
-
-    // Phase 2: receive and reconstruct for gates where I am the target
-    for (int target = 0; target < 3; ++target) {
-      const auto& tg = by_target[target];
-      if (tg.empty() || my_pid_ != target) continue;
-
-      const size_t n = tg.size();
-      std::vector<T> recv_buf(n);
-      net_.recv_ring<T>(recv_buf.data(), n, prev_party(target));
-
-      for (size_t i = 0; i < n; ++i) {
-        const auto& s = wires_[tg[i]->in];
-        T plain = s.left() + s.right() + recv_buf[i];
-        wires_[tg[i]->out] = RSSShare<T>(plain, T{}, my_pid_);
+      std::vector<wire_t> inputs(n);
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        inputs[i] = tg[i]->in;
       }
-    }
 
-    // next_party(target) gates: output wire = 0 (secret not revealed to them)
-    for (int target = 0; target < 3; ++target) {
-      const auto& tg = by_target[target];
-      if (tg.empty() || my_pid_ != next_party(target)) continue;
-      for (const auto* g : tg)
-        wires_[g->out] = RSSShare<T>(T{}, T{}, my_pid_);
+      const std::vector<T> plains = reconstructTo(inputs, target);
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        const T val = (my_pid_ == target) ? plains[i] : T{};
+        wires_[tg[i]->out] = RSSShare<T>(val, T{}, my_pid_);
+      }
     }
   }
 
@@ -563,7 +585,11 @@ class OnlineEvaluator {
   static std::vector<T> applyPerm(const std::vector<size_t>& perm,
                                   const std::vector<T>& v) {
     std::vector<T> out(perm.size());
-    for (size_t j = 0; j < perm.size(); ++j) out[j] = v[perm[j]];
+    #pragma omp parallel for if(perm.size() >= kParallelInteractiveThreshold) schedule(static)
+    for (long long jj = 0; jj < static_cast<long long>(perm.size()); ++jj) {
+      const size_t j = static_cast<size_t>(jj);
+      out[j] = v[perm[j]];
+    }
     return out;
   }
 
@@ -696,19 +722,29 @@ class OnlineEvaluator {
       if (my_pid_ == 0) {
         // X1 = pi_12(A+B+Z12),  X2 = pi_31(X1+Z31)
         std::vector<T> V(n);
-        for (size_t i = 0; i < n; ++i)
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           V[i] = wires_[g.ins[i]].left() + wires_[g.ins[i]].right() + m.Z12[i];
+        }
         std::vector<T> X1 = applyPerm(*m.perm_12, V);
         std::vector<T> X2(n);
-        for (size_t i = 0; i < n; ++i) X2[i] = X1[i] + m.Z31[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          X2[i] = X1[i] + m.Z31[i];
+        }
         X2 = applyPerm(*m.perm_31, X2);
         net_.send_ring<T>(X2.data(), n, 1);  // P0 → P1
       }
       if (my_pid_ == 1) {
         // Y1 = pi_12(C−Z12)  (C = right share of P1)
         std::vector<T> W(n);
-        for (size_t i = 0; i < n; ++i)
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           W[i] = wires_[g.ins[i]].right() - m.Z12[i];
+        }
         std::vector<T> Y1 = applyPerm(*m.perm_12, W);
         net_.send_ring<T>(Y1.data(), n, 2);  // P1 → P2
       }
@@ -725,10 +761,18 @@ class OnlineEvaluator {
         // Recv X2 from P0;  X3 = pi_23(X2+Z23);  C_tilde_1 = X3 − B_tilde
         std::vector<T> X2(n);
         net_.recv_ring<T>(X2.data(), n, 0);
-        for (size_t i = 0; i < n; ++i) m.X3[i] = X2[i] + m.Z23[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.X3[i] = X2[i] + m.Z23[i];
+        }
         m.X3 = applyPerm(*m.perm_23, m.X3);
         m.C_tilde_1.resize(n);
-        for (size_t i = 0; i < n; ++i) m.C_tilde_1[i] = m.X3[i] - m.B_tilde[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.C_tilde_1[i] = m.X3[i] - m.B_tilde[i];
+        }
         net_.send_ring<T>(m.C_tilde_1.data(), n, 2);  // P1 → P2
       }
       if (my_pid_ == 2) {
@@ -736,12 +780,24 @@ class OnlineEvaluator {
         std::vector<T> Y1(n);
         net_.recv_ring<T>(Y1.data(), n, 1);
         std::vector<T> Y2(n);
-        for (size_t i = 0; i < n; ++i) Y2[i] = Y1[i] - m.Z31[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          Y2[i] = Y1[i] - m.Z31[i];
+        }
         Y2 = applyPerm(*m.perm_31, Y2);
-        for (size_t i = 0; i < n; ++i) m.Y3[i] = Y2[i] - m.Z23[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.Y3[i] = Y2[i] - m.Z23[i];
+        }
         m.Y3 = applyPerm(*m.perm_23, m.Y3);
         m.C_tilde_2.resize(n);
-        for (size_t i = 0; i < n; ++i) m.C_tilde_2[i] = m.Y3[i] - m.A_tilde[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          m.C_tilde_2[i] = m.Y3[i] - m.A_tilde[i];
+        }
         net_.send_ring<T>(m.C_tilde_2.data(), n, 1);  // P2 → P1
       }
     }
@@ -758,17 +814,27 @@ class OnlineEvaluator {
         // Recv C_tilde_2 from P2;  C_tilde = C_tilde_1 + C_tilde_2
         std::vector<T> recv(n);
         net_.recv_ring<T>(recv.data(), n, 2);
-        for (size_t i = 0; i < n; ++i) C_tilde[i] = m.C_tilde_1[i] + recv[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          C_tilde[i] = m.C_tilde_1[i] + recv[i];
+        }
       }
       if (my_pid_ == 2) {
         // Recv C_tilde_1 from P1;  C_tilde = C_tilde_1 + C_tilde_2
         std::vector<T> recv(n);
         net_.recv_ring<T>(recv.data(), n, 1);
-        for (size_t i = 0; i < n; ++i) C_tilde[i] = recv[i] + m.C_tilde_2[i];
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          C_tilde[i] = recv[i] + m.C_tilde_2[i];
+        }
       }
 
       // Output RSS: P0:(A_tilde, B_tilde)  P1:(B_tilde, C_tilde)  P2:(C_tilde, A_tilde)
-      for (size_t j = 0; j < n; ++j) {
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
         if (my_pid_ == 0)
           wires_[g.outs[j]] = RSSShare<T>(m.A_tilde[j], m.B_tilde[j], my_pid_);
         else if (my_pid_ == 1)
