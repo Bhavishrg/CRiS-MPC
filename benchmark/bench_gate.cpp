@@ -1,6 +1,6 @@
 // benchmark/bench_gate.cpp
 //
-// Single-gate benchmark for CRiS-MPC.
+// Protocol-flexible single-gate benchmark for CRiS-MPC.
 //
 // Supported gates:
 //   add   -> kAdd
@@ -10,28 +10,17 @@
 //   csub  -> kCSub
 //   cmul  -> kCMul
 //
+// Protocols:
+//   rss3  -> existing 3-party replicated secret sharing
+//   nph   -> n-party additive sharing with one helper in preprocessing
+//
 // Usage:
-//   ./run.sh bench_gate --gate add  --x 10 --y 20 --vec-size 1000
-//   ./run.sh bench_gate --gate sub  --x 10 --y 20 --vec-size 1000
-//   ./run.sh bench_gate --gate mul  --x 10 --y 20 --vec-size 1000
-//   ./run.sh bench_gate --gate cadd --x 10 --y 7  --vec-size 1000
-//   ./run.sh bench_gate --gate csub --x 10 --y 7  --vec-size 1000
-//   ./run.sh bench_gate --gate cmul --x 10 --y 7  --vec-size 1000
-//
-// For cadd/csub/cmul:
-//   x is the secret input.
-//   y is treated as the public constant.
-//
-// Inputs:
-//   x is owned by P0.
-//   y is owned by P1 for add/sub/mul.
-//   For cadd/csub/cmul, y is public and no P1 input is created.
+//   ./run.sh bench_gate --protocol rss3 --gate mul --x 10 --y 20 --vec-size 1000
+//   ./run.sh bench_gate --protocol nph  --num-parties 5 --gate mul --x 10 --y 20 --vec-size 1000
 
-#include "3pc/arith/offline_evaluator.h"
-#include "3pc/arith/online_evaluator.h"
 #include "3pc/circuit/circuit.h"
-#include "3pc/net/net3p.h"
 #include "benchmark/utils.h"
+#include "common/protocol_runner.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -55,29 +44,12 @@ enum class BenchGate {
 };
 
 static BenchGate parseGateName(const std::string& gate) {
-    if (gate == "add" || gate == "kAdd") {
-        return BenchGate::Add;
-    }
-
-    if (gate == "sub" || gate == "kSub") {
-        return BenchGate::Sub;
-    }
-
-    if (gate == "mul" || gate == "kMul") {
-        return BenchGate::Mul;
-    }
-
-    if (gate == "cadd" || gate == "kCAdd") {
-        return BenchGate::CAdd;
-    }
-
-    if (gate == "csub" || gate == "kCSub") {
-        return BenchGate::CSub;
-    }
-
-    if (gate == "cmul" || gate == "kCMul") {
-        return BenchGate::CMul;
-    }
+    if (gate == "add" || gate == "kAdd") return BenchGate::Add;
+    if (gate == "sub" || gate == "kSub") return BenchGate::Sub;
+    if (gate == "mul" || gate == "kMul") return BenchGate::Mul;
+    if (gate == "cadd" || gate == "kCAdd") return BenchGate::CAdd;
+    if (gate == "csub" || gate == "kCSub") return BenchGate::CSub;
+    if (gate == "cmul" || gate == "kCMul") return BenchGate::CMul;
 
     throw std::invalid_argument(
         "Unknown gate. Use one of: add, sub, mul, cadd, csub, cmul");
@@ -92,7 +64,6 @@ static const char* gateName(BenchGate gate) {
         case BenchGate::CSub: return "kCSub";
         case BenchGate::CMul: return "kCMul";
     }
-
     return "unknown";
 }
 
@@ -104,7 +75,6 @@ static bool isBinaryGate(BenchGate gate) {
 
 struct CircuitData {
     LevelOrderedCircuit lc;
-
     std::vector<wire_t> x_wires;
     std::vector<wire_t> y_wires;
     std::vector<wire_t> out_wires;
@@ -112,25 +82,13 @@ struct CircuitData {
 
 static T evalCleartext(BenchGate gate, T x, T y) {
     switch (gate) {
-        case BenchGate::Add:
-            return x + y;
-
-        case BenchGate::Sub:
-            return x - y;
-
-        case BenchGate::Mul:
-            return x * y;
-
-        case BenchGate::CAdd:
-            return x + y;
-
-        case BenchGate::CSub:
-            return x - y;
-
-        case BenchGate::CMul:
-            return x * y;
+        case BenchGate::Add:  return x + y;
+        case BenchGate::Sub:  return x - y;
+        case BenchGate::Mul:  return x * y;
+        case BenchGate::CAdd: return x + y;
+        case BenchGate::CSub: return x - y;
+        case BenchGate::CMul: return x * y;
     }
-
     return T{0};
 }
 
@@ -149,7 +107,6 @@ static CircuitData generateCircuit(BenchGate gate,
 
     if (isBinaryGate(gate)) {
         cd.y_wires.resize(vec_size);
-
         for (size_t i = 0; i < vec_size; ++i) {
             cd.y_wires[i] = c.newInputWire(P1);
         }
@@ -197,11 +154,16 @@ static CircuitData generateCircuit(BenchGate gate,
 
 struct Args {
     int pid = -1;
+
+    std::string protocol_name = "rss3";
+    protocol::ProtocolKind protocol = protocol::ProtocolKind::Rss3;
+    int num_parties = 3;  // compute parties; nph has one extra helper process
+    bool pking = false;   // nph only: reconstruct through P0 in two rounds
+
     std::string gate_name;
     BenchGate gate = BenchGate::Add;
 
     size_t vec_size = 0;
-
     T x = 0;
     T y = 0;
 
@@ -214,9 +176,9 @@ struct Args {
 
 static void printUsage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --pid <0|1|2> --gate <gate> --x <value> --y <value> "
-        "--vec-size <N> [--port <p>] [--peer <addr>] "
-        "[--repeat <r>] [--output <file>]\n\n"
+        "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
+        "--gate <gate> --x <value> --y <value> --vec-size <N> "
+        "[--pking] [--port <p>] [--peer <addr>] [--repeat <r>] [--output <file>]\n\n"
         "Supported gates:\n"
         "  add   -> kAdd\n"
         "  sub   -> kSub\n"
@@ -224,6 +186,10 @@ static void printUsage(const char* prog) {
         "  cadd  -> kCAdd\n"
         "  csub  -> kCSub\n"
         "  cmul  -> kCMul\n\n"
+        "Protocols:\n"
+        "  rss3: --num-parties must be 3, pids 0..2\n"
+        "  nph : --num-parties is the number of compute parties, helper pid is n\n"
+        "        --pking enables two-round reconstruction through P0\n\n"
         "For cadd/csub/cmul, --y is treated as the public constant.\n",
         prog);
 }
@@ -238,6 +204,11 @@ static Args parseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             a.pid = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {
+            a.protocol_name = argv[++i];
+            a.protocol = protocol::parseProtocolKind(a.protocol_name);
+        } else if (std::strcmp(argv[i], "--num-parties") == 0 && i + 1 < argc) {
+            a.num_parties = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--gate") == 0 && i + 1 < argc) {
             a.gate_name = argv[++i];
             a.gate = parseGateName(a.gate_name);
@@ -252,6 +223,8 @@ static Args parseArgs(int argc, char* argv[]) {
             a.vec_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             a.port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--pking") == 0) {
+            a.pking = true;
         } else if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             a.peer = argv[++i];
         } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
@@ -265,12 +238,15 @@ static Args parseArgs(int argc, char* argv[]) {
         }
     }
 
-    if (a.pid < 0 || a.pid > 2 ||
-        !seen_gate ||
-        !seen_x ||
-        !seen_y ||
-        a.vec_size == 0 ||
-        a.repeat <= 0) {
+    bool pid_ok = false;
+    if (a.protocol == protocol::ProtocolKind::Rss3) {
+        pid_ok = (a.pid >= 0 && a.pid < 3 && a.num_parties == 3);
+    } else if (a.protocol == protocol::ProtocolKind::Nph) {
+        pid_ok = (a.num_parties >= 2 && a.pid >= 0 && a.pid <= a.num_parties);
+    }
+
+    if (!pid_ok || !seen_gate || !seen_x || !seen_y ||
+        a.vec_size == 0 || a.repeat <= 0) {
         printUsage(argv[0]);
         std::exit(1);
     }
@@ -291,31 +267,40 @@ static void printVector(const char* label,
                     i + 1 < m ? ", " : "");
     }
 
-    if (v.size() > max_items) {
-        std::printf(", ...");
-    }
-
+    if (v.size() > max_items) std::printf(", ...");
     std::printf("]\n");
 }
 
 static void benchmark(const Args& args) {
-    using SP = bench::StatsPoint<Net3P>;
+    using Runner = protocol::IProtocolRunner<T>;
+    using SP = bench::StatsPoint<Runner>;
 
     const int pid = args.pid;
     const size_t n = args.vec_size;
 
     std::printf("\n=== bench_gate ===\n");
-    std::printf("  gate     : %s\n", gateName(args.gate));
-    std::printf("  pid      : %d\n", pid);
-    std::printf("  vec_size : %zu\n", n);
-    std::printf("  x        : %llu\n",
+    std::printf("  protocol    : %s\n", protocol::protocolName(args.protocol));
+    std::printf("  num_parties : %d%s\n",
+                args.num_parties,
+                args.protocol == protocol::ProtocolKind::Nph
+                    ? " compute parties + 1 helper"
+                    : "");
+    std::printf("  pking      : %s\n", args.pking ? "true" : "false");
+    std::printf("  gate        : %s\n", gateName(args.gate));
+    std::printf("  pid         : %d%s\n",
+                pid,
+                (args.protocol == protocol::ProtocolKind::Nph && pid == args.num_parties)
+                    ? " (helper)"
+                    : "");
+    std::printf("  vec_size    : %zu\n", n);
+    std::printf("  x           : %llu\n",
                 static_cast<unsigned long long>(args.x));
-    std::printf("  y        : %llu%s\n",
+    std::printf("  y           : %llu%s\n",
                 static_cast<unsigned long long>(args.y),
                 isBinaryGate(args.gate) ? "" : "  (public constant)");
-    std::printf("  port     : %d\n", args.port);
-    std::printf("  peer     : %s\n", args.peer.c_str());
-    std::printf("  repeat   : %d\n\n", args.repeat);
+    std::printf("  port        : %d\n", args.port);
+    std::printf("  peer        : %s\n", args.peer.c_str());
+    std::printf("  repeat      : %d\n\n", args.repeat);
 
     std::printf("[P%d] Building circuit...\n", pid);
     CircuitData cd = generateCircuit(args.gate, n, args.y);
@@ -332,32 +317,44 @@ static void benchmark(const Args& args) {
 
     if (n <= 20) {
         printVector("x", pid, x_vals);
-
-        if (isBinaryGate(args.gate)) {
-            printVector("y", pid, y_vals);
-        } else {
-            std::printf("[P%d]   const: %llu\n",
-                        pid,
-                        static_cast<unsigned long long>(args.y));
-        }
-
+        if (isBinaryGate(args.gate)) printVector("y", pid, y_vals);
+        else std::printf("[P%d]   const: %llu\n",
+                         pid,
+                         static_cast<unsigned long long>(args.y));
         printVector("expected", pid, expected);
     }
 
-    const char* peer_c = args.peer.c_str();
-    const char* ips[3] = {peer_c, peer_c, peer_c};
+    protocol::ProtocolConfig pcfg;
+    pcfg.kind = args.protocol;
+    pcfg.pid = args.pid;
+    pcfg.num_compute_parties = args.num_parties;
+    pcfg.port = args.port;
+    pcfg.peer = args.peer;
+    pcfg.pking = args.pking;
 
     std::printf("\n[P%d] Connecting...\n", pid);
-    Net3P net(pid, ips, args.port);
+    auto runner = protocol::makeProtocolRunner<T>(pcfg);
     std::printf("[P%d] Connected.\n\n", pid);
 
-    bench::increaseSocketBuffers(net, 128 * 1024 * 1024);
+    bench::increaseSocketBuffers(*runner, 128 * 1024 * 1024);
+
+    // Input values are registered once and reused across repetitions.
+    if (!runner->isHelper() && pid == P0) {
+        runner->setInputs(cd.x_wires, x_vals);
+    }
+    if (!runner->isHelper() && isBinaryGate(args.gate) && pid == P1) {
+        runner->setInputs(cd.y_wires, y_vals);
+    }
 
     nlohmann::json output_doc;
     output_doc["details"] = {
         {"benchmark", "bench_gate"},
-        {"gate", gateName(args.gate)},
+        {"protocol", protocol::protocolName(args.protocol)},
+        {"num_compute_parties", args.num_parties},
+        {"pking", args.pking},
         {"pid", pid},
+        {"is_helper", runner->isHelper()},
+        {"gate", gateName(args.gate)},
         {"vec_size", n},
         {"x", args.x},
         {"y", args.y},
@@ -374,55 +371,41 @@ static void benchmark(const Args& args) {
                         pid, run + 1, args.repeat);
         }
 
-        net.resetCounters();
+        runner->resetCounters();
 
         std::printf("[P%d] Offline...\n", pid);
-        SP offline_start(net);
-
-        OfflineEvaluator<T> offline(pid, net);
-        offline.run(lc);
-
-        SP offline_end(net);
+        SP offline_start(*runner);
+        runner->offline(lc);
+        SP offline_end(*runner);
         auto offline_stats = offline_end - offline_start;
 
         std::printf("[P%d] Online...\n", pid);
-        OnlineEvaluator<T> ev(pid, net, offline.take_prg());
-
-        if (pid == P0) {
-            ev.setInputs(cd.x_wires, x_vals);
-        }
-
-        if (isBinaryGate(args.gate) && pid == P1) {
-            ev.setInputs(cd.y_wires, y_vals);
-        }
-
-        SP online_start(net);
-
-        ev.evaluate(lc);
-        auto outputs = ev.getOutputs(lc);
-
-        SP online_end(net);
+        SP online_start(*runner);
+        runner->online(lc);
+        auto out = runner->getOutputs(lc);
+        SP online_end(*runner);
         auto online_stats = online_end - online_start;
 
-        const std::vector<T>& out = outputs.vals;
-
-        bool ok = (out.size() == expected.size());
-
-        if (ok) {
-            for (size_t i = 0; i < n; ++i) {
-                if (out[i] != expected[i]) {
-                    ok = false;
-                    break;
+        bool ok = true;
+        if (!runner->isHelper()) {
+            ok = (out.size() == expected.size());
+            if (ok) {
+                for (size_t i = 0; i < n; ++i) {
+                    if (out[i] != expected[i]) {
+                        ok = false;
+                        break;
+                    }
                 }
             }
         }
 
-        std::printf("[P%d] %s correctness: %s\n",
+        std::printf("[P%d] %s correctness: %s%s\n",
                     pid,
                     gateName(args.gate),
-                    ok ? "PASS" : "FAIL");
+                    runner->isHelper() ? "SKIP" : (ok ? "PASS" : "FAIL"),
+                    runner->isHelper() ? " (helper has no outputs)" : "");
 
-        if (!ok || n <= 20) {
+        if ((!runner->isHelper() && (!ok || n <= 20))) {
             printVector("output", pid, out);
         }
 
@@ -453,7 +436,8 @@ static void benchmark(const Args& args) {
 
         output_doc["runs"].push_back({
             {"run", run + 1},
-            {"correct", ok},
+            {"correct", runner->isHelper() ? true : ok},
+            {"helper_skip", runner->isHelper()},
             {"offline", offline_stats},
             {"online", online_stats},
             {"total", total_stats}
