@@ -322,9 +322,7 @@ class OnlineEvaluator {
 
         // Public constants are injected into replicated sub-share s_0.
         // Since s_0 is held by P0 as its left share and by P2 as its
-        // right share, both copies must be updated.  Updating only P0.left
-        // makes reconstruction correct for P0/P1 but wrong for P2 and also
-        // breaks later multiplication with this value.
+        // right share, both copies must be updated.
         if (my_pid_ == P0) left  += g.cval;
         if (my_pid_ == P2) right += g.cval;
 
@@ -496,8 +494,6 @@ class OnlineEvaluator {
     if (gates.empty()) return;
     const size_t n = gates.size();
 
-    // PRG state is not thread-safe, so sample masks sequentially/batched first.
-    // The arithmetic using those masks is embarrassingly parallel.
     std::vector<T> gamma_nxt(n), gamma_prv(n), z(n), z_nxt(n);
     prg_.next_next<T>(gamma_nxt.data(), n);
     prg_.next_prev<T>(gamma_prv.data(), n);
@@ -533,7 +529,7 @@ class OnlineEvaluator {
 
   // ── Batch: kRec — all parties reconstruct ────────────────────────────────
   //
-  // Delegate the communication to reconstruct(ws), then store each plaintext as
+  // Calls reconstruct(ws) to store each secret-shared wire as
   // a public/plain wire represented by (plain, 0).
   void batchRec(const std::vector<const FIn1Gate*>& gates) {
     if (gates.empty()) return;
@@ -557,10 +553,8 @@ class OnlineEvaluator {
 
   // ── Batch: kRecP — targeted reconstruction ───────────────────────────────
   //
-  // Delegate the communication to reconstructTo(ws, target).  All parties call
-  // reconstructTo for every non-empty target batch, so send/recv ordering stays
-  // identical across parties.  Only the target receives plaintexts; all other
-  // parties store zero shares on the output wires.
+  // All parties call reconstructTo for every non-empty target batch.  
+  // Only the target receives plaintexts; all other parties store zero shares on the output wires.
   void batchRecP(const std::array<std::vector<const FIn1Gate*>, 3>& by_target) {
     for (int target = 0; target < 3; ++target) {
       const auto& tg = by_target[target];
@@ -623,8 +617,6 @@ class OnlineEvaluator {
   //
   //   out[perm[j]] = v[j].
   //
-  // This is the operation needed by Unshuffle, because unshuffle applies the
-  // inverse of each cached pair permutation.
   static std::vector<T> applyInvPerm(const std::vector<size_t>& perm,
                                      const std::vector<T>& v) {
     std::vector<T> out(perm.size());
