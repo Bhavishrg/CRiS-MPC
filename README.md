@@ -15,18 +15,35 @@ CRiS-MPC/
 │   ├── arith/
 │   │   ├── offline_evaluator.h
 │   │   └── online_evaluator.h
-│   ├── circuit/
-│   │   ├── circuit.h
-│   │   └── gate.h
-│   ├── core/
+│   ├── utils/
 │   │   ├── prg3p.h
 │   │   ├── share.h
 │   │   └── types.h
 │   └── net/
 │       └── net3p.h
+├── common/
+│   ├── circuit/
+│   │   ├── circuit.h
+│   │   └── gate.h
+│   ├── protocol_runner.h
+│   └── types.h
+├── nph/
+│   ├── arith/
+│   │   ├── offline_evaluator.h
+│   │   └── online_evaluator.h
+│   ├── net/
+│   │   └── net_np.h
+│   └── utils/
+│       ├── prg_np.h
+│       ├── share.h
+│       └── types.h
 ├── benchmark/
-│   ├── bench_ops.cpp
+│   ├── bench_gate.cpp
+│   ├── bench_linear.cpp
+│   ├── bench_mult.cpp
 │   ├── bench_propagate.cpp
+│   ├── bench_sort.cpp
+│   ├── bench_unshuffle.cpp
 │   ├── utils.cpp
 │   ├── utils.h
 │   └── CMakeLists.txt
@@ -99,12 +116,13 @@ RESULTS_DIR=./Results/cris_mpc_results ./run.sh bench_propagate --vec-size 10 --
 
 ## Available Benchmarks
 
-### `bench_ops`
+### `bench_gate`
 
-Benchmarks basic MPC operations such as multiplication, reconstruction.
+Benchmarks vectorized basic gates such as addition, multiplication, and
+constant operations.
 
 ```bash
-./run.sh bench_ops
+./run.sh bench_gate --gate mul --x 10 --y 20 --vec-size 1000
 ```
 
 ### `bench_propagate`

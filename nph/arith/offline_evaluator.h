@@ -1,6 +1,6 @@
 #pragma once
 
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "nph/net/net_np.h"
 #include "nph/utils/prg_np.h"
 #include "nph/utils/share.h"
@@ -104,6 +104,9 @@ class OfflineEvaluator {
   Preprocessing<T> preproc_;
   PairwisePRG pairwise_prg_;
 
+  static constexpr size_t kParallelPreprocThreshold = 8192;
+  static constexpr size_t kParallelPermThreshold = 8192;
+
   int helper_pid() const { return num_compute_parties_; }
   int last_compute_pid() const { return num_compute_parties_ - 1; }
   bool is_helper() const { return pid_ == helper_pid(); }
@@ -124,11 +127,16 @@ class OfflineEvaluator {
     if (perm.size() != v.size()) {
       throw std::invalid_argument("NPH OfflineEvaluator::applyPerm: size mismatch");
     }
-    std::vector<T> out(perm.size());
     for (size_t i = 0; i < perm.size(); ++i) {
       if (perm[i] >= v.size()) {
         throw std::runtime_error("NPH OfflineEvaluator::applyPerm: index out of range");
       }
+    }
+
+    std::vector<T> out(perm.size());
+    #pragma omp parallel for if(perm.size() >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(perm.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       // Pull convention used by the circuit/evaluator: out[i] = v[perm[i]].
       out[i] = v[perm[i]];
     }
@@ -140,11 +148,16 @@ class OfflineEvaluator {
     if (perm.size() != v.size()) {
       throw std::invalid_argument("NPH OfflineEvaluator::applyInversePerm: size mismatch");
     }
-    std::vector<T> out(perm.size());
     for (size_t i = 0; i < perm.size(); ++i) {
       if (perm[i] >= v.size()) {
         throw std::runtime_error("NPH OfflineEvaluator::applyInversePerm: index out of range");
       }
+    }
+
+    std::vector<T> out(perm.size());
+    #pragma omp parallel for if(perm.size() >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(perm.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       // Inverse of out[i] = v[perm[i]] is out[perm[i]] = v[i].
       out[perm[i]] = v[i];
     }
@@ -258,8 +271,20 @@ class OfflineEvaluator {
   void helperGenerateTriples(size_t num_triples) {
     const int last = last_compute_pid();
     std::vector<T> last_c_shares(num_triples, T{});
+    std::vector<std::vector<T>> sampled(static_cast<size_t>(num_compute_parties_));
 
-    for (size_t i = 0; i < num_triples; ++i) {
+    // PRG state is serial.  Draw each helper-party stream in exactly the same
+    // order as the old per-triple loop: a, b, and c for non-final parties.
+    for (int p = 0; p < num_compute_parties_; ++p) {
+      const size_t fields_per_triple = (p == last) ? 2 : 3;
+      auto& stream = sampled[static_cast<size_t>(p)];
+      stream.resize(fields_per_triple * num_triples);
+      pairwise_prg_.next<T>(p, stream.data(), stream.size());
+    }
+
+    #pragma omp parallel for if(num_triples >= kParallelPreprocThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(num_triples); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       T a{};
       T b{};
       T c_share_sum{};
@@ -267,14 +292,17 @@ class OfflineEvaluator {
       // Sample all a_i and b_i from helper-compute PRGs. The corresponding
       // compute party samples the same values locally.
       for (int p = 0; p < num_compute_parties_; ++p) {
-        const T a_p = pairwise_prg_.next<T>(p);
-        const T b_p = pairwise_prg_.next<T>(p);
+        const size_t fields_per_triple = (p == last) ? 2 : 3;
+        const auto& stream = sampled[static_cast<size_t>(p)];
+        const size_t base = fields_per_triple * i;
+        const T a_p = stream[base];
+        const T b_p = stream[base + 1];
         a += a_p;
         b += b_p;
 
         // Sample c_i non-interactively for all but the last compute party.
         if (p != last) {
-          const T c_p = pairwise_prg_.next<T>(p);
+          const T c_p = stream[base + 2];
           c_share_sum += c_p;
         }
       }
@@ -299,14 +327,21 @@ class OfflineEvaluator {
       net_.recv_ring<T>(received_last_c.data(), received_last_c.size(), helper);
     }
 
-    for (size_t i = 0; i < num_triples; ++i) {
-      preproc_.triples[i].a = AdditiveShare<T>(pairwise_prg_.next<T>(helper));
-      preproc_.triples[i].b = AdditiveShare<T>(pairwise_prg_.next<T>(helper));
+    const size_t fields_per_triple = (pid_ == last) ? 2 : 3;
+    std::vector<T> sampled(fields_per_triple * num_triples);
+    pairwise_prg_.next<T>(helper, sampled.data(), sampled.size());
+
+    #pragma omp parallel for if(num_triples >= kParallelPreprocThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(num_triples); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const size_t base = fields_per_triple * i;
+      preproc_.triples[i].a = AdditiveShare<T>(sampled[base]);
+      preproc_.triples[i].b = AdditiveShare<T>(sampled[base + 1]);
 
       if (pid_ == last) {
         preproc_.triples[i].c = AdditiveShare<T>(received_last_c[i]);
       } else {
-        preproc_.triples[i].c = AdditiveShare<T>(pairwise_prg_.next<T>(helper));
+        preproc_.triples[i].c = AdditiveShare<T>(sampled[base + 2]);
       }
     }
   }
@@ -459,8 +494,11 @@ class OfflineEvaluator {
 
           opening_masks[static_cast<size_t>(p)] = sampleVectorWithParty(p, n);
           chain_masks[static_cast<size_t>(p)] = sampleVectorWithParty(p, n);
-          for (size_t j = 0; j < n; ++j) {
-            R[j] += opening_masks[static_cast<size_t>(p)][j];
+          const auto& opening = opening_masks[static_cast<size_t>(p)];
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            R[j] += opening[j];
           }
         }
 
@@ -475,7 +513,11 @@ class OfflineEvaluator {
                 permutationForParty(gate, p, perm_cache, fresh_group);
             delta = applyPerm(pi, delta);
             const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
-            for (size_t j = 0; j < n; ++j) delta[j] += b[j];
+            #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              delta[j] += b[j];
+            }
           }
         } else {
           for (int p = num_compute_parties_ - 1; p >= 0; --p) {
@@ -483,7 +525,11 @@ class OfflineEvaluator {
                 permutationForParty(gate, p, perm_cache, fresh_group);
             delta = applyInversePerm(pi, delta);
             const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
-            for (size_t j = 0; j < n; ++j) delta[j] += b[j];
+            #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              delta[j] += b[j];
+            }
           }
         }
 
@@ -495,12 +541,20 @@ class OfflineEvaluator {
         for (int p = 0; p < num_compute_parties_; ++p) {
           if (p == final_party) continue;
           const std::vector<T> delta_p = sampleVectorWithParty(p, n);
-          for (size_t j = 0; j < n; ++j) delta_sum[j] += delta_p[j];
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            delta_sum[j] += delta_p[j];
+          }
         }
 
         auto& missing = missing_delta_flat[static_cast<size_t>(final_party)];
-        for (size_t j = 0; j < n; ++j) {
-          missing.push_back(delta[j] - delta_sum[j]);
+        const size_t base = missing.size();
+        missing.resize(base + n);
+        #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+          const size_t j = static_cast<size_t>(jj);
+          missing[base + j] = delta[j] - delta_sum[j];
         }
       } else {
         ShuffleGatePreproc<T> pp;

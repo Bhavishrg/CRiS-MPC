@@ -1,6 +1,6 @@
 #pragma once
 
-#include "3pc/circuit/gate.h"
+#include "common/circuit/gate.h"
 #include <algorithm>
 #include <array>
 #include <memory>

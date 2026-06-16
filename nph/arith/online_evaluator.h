@@ -1,6 +1,6 @@
 #pragma once
 
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "nph/arith/offline_evaluator.h"
 #include "nph/net/net_np.h"
 #include "nph/utils/prg_np.h"
@@ -200,6 +200,10 @@ class OnlineEvaluator {
   size_t shuffle_pos_{0};
   bool evaluation_initialized_{false};
 
+  static constexpr size_t kParallelInteractiveThreshold = 8192;
+  static constexpr size_t kParallelLocalGateThreshold = 8192;
+  static constexpr size_t kParallelPermThreshold = 8192;
+
   int helper_pid() const { return num_compute_parties_; }
 
   void initializeEvaluation(const LevelOrderedCircuit& lc) {
@@ -281,8 +285,16 @@ class OnlineEvaluator {
   }
 
   void evalLocalSublevel(const std::vector<gate_ptr_t>& local_level) {
-    for (const auto& gp : local_level)
-      evalLocalGate(*gp);
+    if (local_level.empty()) return;
+
+    if (local_level.size() >= kParallelLocalGateThreshold) {
+      #pragma omp parallel for schedule(static)
+      for (long long i = 0; i < static_cast<long long>(local_level.size()); ++i)
+        evalLocalGate(*local_level[static_cast<size_t>(i)]);
+    } else {
+      for (const auto& gp : local_level)
+        evalLocalGate(*gp);
+    }
   }
 
   void evalLocalGate(const Gate& gate) {
@@ -341,17 +353,34 @@ class OnlineEvaluator {
       if (gates.empty()) continue;
 
       if (pid_ == owner) {
-        for (const auto* g : gates) {
+        const size_t n = gates.size();
+        std::vector<std::vector<T>> peer_masks(static_cast<size_t>(num_compute_parties_));
+        for (int p = 0; p < num_compute_parties_; ++p) {
+          if (p == owner) continue;
+          peer_masks[static_cast<size_t>(p)].resize(n);
+          pairwise_prg_.next<T>(p, peer_masks[static_cast<size_t>(p)].data(), n);
+        }
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           T sum{};
           for (int p = 0; p < num_compute_parties_; ++p) {
             if (p == owner) continue;
-            sum += pairwise_prg_.next<T>(p);
+            sum += peer_masks[static_cast<size_t>(p)][i];
           }
+          const auto* g = gates[i];
           wires_[g->out] = AdditiveShare<T>(getInput(g->out) - sum);
         }
       } else {
-        for (const auto* g : gates) {
-          wires_[g->out] = AdditiveShare<T>(pairwise_prg_.next<T>(owner));
+        const size_t n = gates.size();
+        std::vector<T> shares(n);
+        pairwise_prg_.next<T>(owner, shares.data(), n);
+
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          wires_[gates[i]->out] = AdditiveShare<T>(shares[i]);
         }
       }
     }
@@ -394,8 +423,11 @@ class OnlineEvaluator {
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == pid_) continue;
         net_.recv_ring<T>(buf.data(), n, p);
-        for (size_t i = 0; i < n; ++i)
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           result[i] += buf[i];
+        }
       }
 
       return result;
@@ -408,8 +440,11 @@ class OnlineEvaluator {
       std::vector<T> buf(n);
       for (int p = 1; p < num_compute_parties_; ++p) {
         net_.recv_ring<T>(buf.data(), n, p);
-        for (size_t i = 0; i < n; ++i)
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           result[i] += buf[i];
+        }
       }
 
       for (int p = 1; p < num_compute_parties_; ++p)
@@ -452,8 +487,11 @@ class OnlineEvaluator {
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == target) continue;
         net_.recv_ring<T>(buf.data(), n, p);
-        for (size_t i = 0; i < n; ++i)
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
           result[i] += buf[i];
+        }
       }
     } else {
       net_.send_ring<T>(my_shares.data(), n, target);
@@ -469,11 +507,16 @@ class OnlineEvaluator {
     if (perm.size() != v.size()) {
       throw std::invalid_argument("NPH OnlineEvaluator::applyPerm: size mismatch");
     }
-    std::vector<T> out(perm.size());
     for (size_t i = 0; i < perm.size(); ++i) {
       if (perm[i] >= v.size()) {
         throw std::runtime_error("NPH OnlineEvaluator::applyPerm: index out of range");
       }
+    }
+
+    std::vector<T> out(perm.size());
+    #pragma omp parallel for if(perm.size() >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(perm.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       // Pull convention: out[i] = v[perm[i]].
       out[i] = v[perm[i]];
     }
@@ -485,11 +528,16 @@ class OnlineEvaluator {
     if (perm.size() != v.size()) {
       throw std::invalid_argument("NPH OnlineEvaluator::applyInversePerm: size mismatch");
     }
-    std::vector<T> out(perm.size());
     for (size_t i = 0; i < perm.size(); ++i) {
       if (perm[i] >= v.size()) {
         throw std::runtime_error("NPH OnlineEvaluator::applyInversePerm: index out of range");
       }
+    }
+
+    std::vector<T> out(perm.size());
+    #pragma omp parallel for if(perm.size() >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(perm.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       // Inverse of out[i] = v[perm[i]] is out[perm[i]] = v[i].
       out[perm[i]] = v[i];
     }
@@ -539,8 +587,12 @@ class OnlineEvaluator {
       const ShuffleGate& g = *gates[gi];
       const ShuffleGatePreproc<T>& pp = *pps[gi];
       const size_t n = g.ins.size();
-      for (size_t j = 0; j < n; ++j)
-        masked[offset + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[base + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      }
       offset += n;
     }
 
@@ -573,10 +625,13 @@ class OnlineEvaluator {
       const ShuffleGate& g = *gates[gi];
       const ShuffleGatePreproc<T>& pp = *pps[gi];
       const size_t n = g.outs.size();
-      for (size_t j = 0; j < n; ++j) {
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
         T out_share = T{} - pp.delta_share[j];
         if (pid_ == last)
-          out_share = chain_value[offset + j] - pp.delta_share[j];
+          out_share = chain_value[base + j] - pp.delta_share[j];
         wires_[g.outs[j]] = AdditiveShare<T>(out_share);
       }
       offset += n;
@@ -630,8 +685,12 @@ class OnlineEvaluator {
       const UnshuffleGate& g = *gates[gi];
       const ShuffleGatePreproc<T>& pp = *pps[gi];
       const size_t n = g.ins.size();
-      for (size_t j = 0; j < n; ++j)
-        masked[offset + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[base + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      }
       offset += n;
     }
 
@@ -662,10 +721,13 @@ class OnlineEvaluator {
       const UnshuffleGate& g = *gates[gi];
       const ShuffleGatePreproc<T>& pp = *pps[gi];
       const size_t n = g.outs.size();
-      for (size_t j = 0; j < n; ++j) {
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
         T out_share = T{} - pp.delta_share[j];
         if (pid_ == 0)
-          out_share = chain_value[offset + j] - pp.delta_share[j];
+          out_share = chain_value[base + j] - pp.delta_share[j];
         wires_[g.outs[j]] = AdditiveShare<T>(out_share);
       }
       offset += n;
@@ -686,8 +748,12 @@ class OnlineEvaluator {
       std::vector<T> slice(flat.begin() + static_cast<std::ptrdiff_t>(offset),
                            flat.begin() + static_cast<std::ptrdiff_t>(offset + n));
       slice = applyPerm(*pp.local_perm, slice);
-      for (size_t j = 0; j < n; ++j)
-        flat[offset + j] = slice[j] + pp.chain_mask[j];
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        flat[base + j] = slice[j] + pp.chain_mask[j];
+      }
       offset += n;
     }
   }
@@ -704,8 +770,12 @@ class OnlineEvaluator {
       std::vector<T> slice(flat.begin() + static_cast<std::ptrdiff_t>(offset),
                            flat.begin() + static_cast<std::ptrdiff_t>(offset + n));
       slice = applyInversePerm(*pp.local_perm, slice);
-      for (size_t j = 0; j < n; ++j)
-        flat[offset + j] = slice[j] + pp.chain_mask[j];
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        flat[base + j] = slice[j] + pp.chain_mask[j];
+      }
       offset += n;
     }
   }
@@ -719,7 +789,9 @@ class OnlineEvaluator {
     }
 
     std::vector<T> d_share(n), e_share(n);
-    for (size_t i = 0; i < n; ++i) {
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       const auto& triple = preproc_.triples[triple_pos_ + i];
       d_share[i] = wires_[gates[i]->in1].value - triple.a.value;
       e_share[i] = wires_[gates[i]->in2].value - triple.b.value;
@@ -729,14 +801,18 @@ class OnlineEvaluator {
     // bandwidth as two separate openings but reduces multiplication latency
     // to one reconstruction phase per multiplication batch.
     std::vector<T> de_share(2 * n);
-    for (size_t i = 0; i < n; ++i) {
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       de_share[2 * i] = d_share[i];
       de_share[2 * i + 1] = e_share[i];
     }
 
     const std::vector<T> de = reconstruct(de_share, pking_);
 
-    for (size_t i = 0; i < n; ++i) {
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       const T d = de[2 * i];
       const T e = de[2 * i + 1];
       const auto& triple = preproc_.triples[triple_pos_ + i];
@@ -753,15 +829,21 @@ class OnlineEvaluator {
 
     const size_t n = gates.size();
     std::vector<T> shares(n);
-    for (size_t i = 0; i < n; ++i)
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       shares[i] = wires_[gates[i]->in].value;
+    }
 
     std::vector<T> plain = reconstruct(shares, pking_);
 
     // Store a public value as additive shares: P0 holds the value and every
     // other compute party holds zero. This keeps later local gates correct.
-    for (size_t i = 0; i < n; ++i)
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       wires_[gates[i]->out] = publicConstantShare<T>(plain[i], pid_);
+    }
   }
 
   void batchRecP(const std::vector<std::vector<const FIn1Gate*>>& by_target) {
@@ -771,15 +853,21 @@ class OnlineEvaluator {
 
       const size_t n = gates.size();
       std::vector<T> shares(n);
-      for (size_t i = 0; i < n; ++i)
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         shares[i] = wires_[gates[i]->in].value;
+      }
 
       std::vector<T> plain = reconstructTo(shares, target);
 
       // Same convention as the 3PC evaluator: the target gets plaintext,
       // non-targets get zero.
-      for (size_t i = 0; i < n; ++i)
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
         wires_[gates[i]->out] = AdditiveShare<T>((pid_ == target) ? plain[i] : T{});
+      }
     }
   }
 

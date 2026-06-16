@@ -1,7 +1,7 @@
 #pragma once
 
 #include "3pc/arith/offline_evaluator.h"
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "3pc/utils/prg3p.h"
 #include "3pc/utils/share.h"
 #include "3pc/net/net3p.h"

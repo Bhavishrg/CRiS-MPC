@@ -20,7 +20,7 @@
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000 --pking
 
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "benchmark/utils.h"
 #include "common/protocol_runner.h"
 
@@ -271,8 +271,8 @@ static void benchmark(const Args& args) {
         std::printf("[P%d] Online...\n", pid);
         SP online_start(*runner);
         runner->online(lc);
-        auto out = runner->getOutputs(lc);
         SP online_end(*runner);
+        auto out = runner->getOutputs(lc);
         auto online_stats = online_end - online_start;
 
         bool ok = true;

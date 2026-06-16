@@ -1,6 +1,6 @@
 #pragma once
 
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "3pc/utils/prg3p.h"
 #include "3pc/net/net3p.h"
 #include <cstddef>

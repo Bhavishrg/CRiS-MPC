@@ -18,7 +18,7 @@
 //   ./run.sh bench_gate --protocol rss3 --gate mul --x 10 --y 20 --vec-size 1000
 //   ./run.sh bench_gate --protocol nph  --num-parties 5 --gate mul --x 10 --y 20 --vec-size 1000
 
-#include "3pc/circuit/circuit.h"
+#include "common/circuit/circuit.h"
 #include "benchmark/utils.h"
 #include "common/protocol_runner.h"
 
