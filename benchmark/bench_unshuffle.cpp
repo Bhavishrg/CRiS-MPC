@@ -1,35 +1,42 @@
-// bench_unshuffle.cpp
+// benchmark/bench_unshuffle.cpp
 //
-// Benchmark and correctness test for the grouped shuffle/unshuffle gates.
+// Protocol-flexible benchmark and correctness test for grouped shuffle/unshuffle.
 //
 // Circuit:
 //   1. P0 provides a secret input vector x[0..n-1].
-//   2. The circuit applies a random grouped shuffle using perm_group_id.
+//   2. The circuit applies a grouped shuffle using perm_group_id.
 //   3. The circuit applies an unshuffle gate with the same perm_group_id.
 //   4. The final vector is reconstructed to all parties.
 //
 // Expected output:
 //   unshuffle(shuffle(x)) = x
 //
-// This benchmark directly tests that kUnshuffle applies the inverse of the
-// hidden permutation cached for the grouped kShuffle gate.
+// Protocols:
+//   rss3  -> existing 3-party replicated secret sharing
+//   nph   -> n-party additive sharing with one helper in preprocessing
+//
+// Usage:
+//   ./run.sh bench_unshuffle --protocol rss3 --vec-size 1000
+//   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000
+//   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000 --pking
 
-#include "3pc/arith/offline_evaluator.h"
-#include "3pc/arith/online_evaluator.h"
 #include "3pc/circuit/circuit.h"
-#include "3pc/net/net3p.h"
 #include "benchmark/utils.h"
+#include "common/protocol_runner.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 using namespace threepc;
 using T = uint64_t;
+
+namespace protocol = ::threepc::protocol;
 
 struct CircuitData {
     LevelOrderedCircuit lc;
@@ -54,8 +61,8 @@ static CircuitData generateCircuit(size_t vec_size) {
      *   shuffle(x, gid)
      *   unshuffle(shuffle(x), gid)
      *
-     * The unshuffle gate must reuse exactly the same cached pairwise
-     * permutations from this group and apply their inverses in reverse order.
+     * The unshuffle gate must reuse exactly the same hidden permutation group
+     * and apply the inverse permutation chain.
      */
     const int perm_group_id = c.freshPermGroupId();
 
@@ -81,17 +88,30 @@ static std::vector<T> makeInputValues(size_t vec_size) {
 
 struct Args {
     int pid = -1;
+
+    std::string protocol_name = "rss3";
+    protocol::ProtocolKind protocol = protocol::ProtocolKind::Rss3;
+    int num_parties = 3;  // compute parties; nph has one extra helper process
+    bool pking = false;   // nph only: reconstruct through P0 in two rounds
+
     size_t vec_size = 0;
+
     int port = 14200;
     std::string peer = "127.0.0.1";
+
     int repeat = 1;
     std::string output;
 };
 
 static void printUsage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --pid <0|1|2> --vec-size <N> "
-        "[--port <p>] [--peer <addr>] [--repeat <r>] [--output <file>]\n",
+        "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
+        "--vec-size <N> [--pking] [--port <p>] [--peer <addr>] "
+        "[--repeat <r>] [--output <file>]\n\n"
+        "Protocols:\n"
+        "  rss3: --num-parties must be 3, pids 0..2\n"
+        "  nph : --num-parties is the number of compute parties, helper pid is n\n"
+        "        --pking enables two-round reconstruction through P0\n",
         prog);
 }
 
@@ -101,10 +121,17 @@ static Args parseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             a.pid = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {
+            a.protocol_name = argv[++i];
+            a.protocol = protocol::parseProtocolKind(a.protocol_name);
+        } else if (std::strcmp(argv[i], "--num-parties") == 0 && i + 1 < argc) {
+            a.num_parties = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--vec-size") == 0 && i + 1 < argc) {
             a.vec_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
             a.port = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--pking") == 0) {
+            a.pking = true;
         } else if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             a.peer = argv[++i];
         } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
@@ -112,13 +139,20 @@ static Args parseArgs(int argc, char* argv[]) {
         } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             a.output = argv[++i];
         } else {
-            std::fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            std::fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
             printUsage(argv[0]);
             std::exit(1);
         }
     }
 
-    if (a.pid < 0 || a.pid > 2 || a.vec_size == 0 || a.repeat <= 0) {
+    bool pid_ok = false;
+    if (a.protocol == protocol::ProtocolKind::Rss3) {
+        pid_ok = (a.pid >= 0 && a.pid < 3 && a.num_parties == 3);
+    } else if (a.protocol == protocol::ProtocolKind::Nph) {
+        pid_ok = (a.num_parties >= 2 && a.pid >= 0 && a.pid <= a.num_parties);
+    }
+
+    if (!pid_ok || a.vec_size == 0 || a.repeat <= 0) {
         printUsage(argv[0]);
         std::exit(1);
     }
@@ -147,20 +181,32 @@ static void printVector(const char* label,
 }
 
 static void benchmark(const Args& args) {
-    using SP = bench::StatsPoint<Net3P>;
+    using Runner = protocol::IProtocolRunner<T>;
+    using SP = bench::StatsPoint<Runner>;
 
     const int pid = args.pid;
     const size_t n = args.vec_size;
 
     std::printf("\n=== bench_unshuffle ===\n");
-    std::printf("  pid      : %d\n", pid);
-    std::printf("  vec_size : %zu\n", n);
-    std::printf("  port     : %d\n", args.port);
-    std::printf("  peer     : %s\n", args.peer.c_str());
-    std::printf("  repeat   : %d\n\n", args.repeat);
+    std::printf("  protocol    : %s\n", protocol::protocolName(args.protocol));
+    std::printf("  num_parties : %d%s\n",
+                args.num_parties,
+                args.protocol == protocol::ProtocolKind::Nph
+                    ? " compute parties + 1 helper"
+                    : "");
+    std::printf("  pking       : %s\n", args.pking ? "true" : "false");
+    std::printf("  pid         : %d%s\n",
+                pid,
+                (args.protocol == protocol::ProtocolKind::Nph && pid == args.num_parties)
+                    ? " (helper)"
+                    : "");
+    std::printf("  vec_size    : %zu\n", n);
+    std::printf("  port        : %d\n", args.port);
+    std::printf("  peer        : %s\n", args.peer.c_str());
+    std::printf("  repeat      : %d\n\n", args.repeat);
 
     std::printf("[P%d] Building circuit...\n", pid);
-    auto cd = generateCircuit(n);
+    CircuitData cd = generateCircuit(n);
     const LevelOrderedCircuit& lc = cd.lc;
 
     std::printf("[P%d] Circuit: %zu gates, %zu wires, depth %zu\n\n",
@@ -174,18 +220,33 @@ static void benchmark(const Args& args) {
         printVector("expected", pid, expected);
     }
 
-    const char* peer_c = args.peer.c_str();
-    const char* ips[3] = {peer_c, peer_c, peer_c};
+    protocol::ProtocolConfig pcfg;
+    pcfg.kind = args.protocol;
+    pcfg.pid = args.pid;
+    pcfg.num_compute_parties = args.num_parties;
+    pcfg.port = args.port;
+    pcfg.peer = args.peer;
+    pcfg.pking = args.pking;
 
     std::printf("\n[P%d] Connecting...\n", pid);
-    Net3P net(pid, ips, args.port);
+    auto runner = protocol::makeProtocolRunner<T>(pcfg);
     std::printf("[P%d] Connected.\n\n", pid);
 
-    bench::increaseSocketBuffers(net, 128 * 1024 * 1024);
+    bench::increaseSocketBuffers(*runner, 128 * 1024 * 1024);
+
+    // P0 owns the input vector. The NPH helper has no input wires.
+    if (!runner->isHelper() && pid == P0) {
+        runner->setInputs(cd.input_wires, input_vals);
+    }
 
     nlohmann::json output_doc;
     output_doc["details"] = {
+        {"benchmark", "bench_unshuffle"},
+        {"protocol", protocol::protocolName(args.protocol)},
+        {"num_compute_parties", args.num_parties},
+        {"pking", args.pking},
         {"pid", pid},
+        {"is_helper", runner->isHelper()},
         {"vec_size", n},
         {"port", args.port},
         {"peer", args.peer},
@@ -199,40 +260,32 @@ static void benchmark(const Args& args) {
                         pid, run + 1, args.repeat);
         }
 
-        net.resetCounters();
+        runner->resetCounters();
 
         std::printf("[P%d] Offline...\n", pid);
-        SP offline_start(net);
-
-        OfflineEvaluator<T> offline(pid, net);
-        offline.run(lc);
-
-        SP offline_end(net);
+        SP offline_start(*runner);
+        runner->offline(lc);
+        SP offline_end(*runner);
         auto offline_stats = offline_end - offline_start;
 
         std::printf("[P%d] Online...\n", pid);
-        OnlineEvaluator<T> ev(pid, net, offline.take_prg());
-
-        if (pid == P0) {
-            ev.setInputs(cd.input_wires, input_vals);
-        }
-
-        SP online_start(net);
-
-        ev.evaluate(lc);
-        auto outputs = ev.getOutputs(lc);
-
-        SP online_end(net);
+        SP online_start(*runner);
+        runner->online(lc);
+        auto out = runner->getOutputs(lc);
+        SP online_end(*runner);
         auto online_stats = online_end - online_start;
 
-        const std::vector<T>& out = outputs.vals;
+        bool ok = true;
+        if (!runner->isHelper()) {
+            ok = (out == expected);
+        }
 
-        bool ok = (out == expected);
+        std::printf("[P%d] Unshuffle correctness: %s%s\n",
+                    pid,
+                    runner->isHelper() ? "SKIP" : (ok ? "PASS" : "FAIL"),
+                    runner->isHelper() ? " (helper has no outputs)" : "");
 
-        std::printf("[P%d] Unshuffle correctness: %s\n",
-                    pid, ok ? "PASS" : "FAIL");
-
-        if (!ok || n <= 20) {
+        if (!runner->isHelper() && (!ok || n <= 20)) {
             printVector("output", pid, out);
         }
 
@@ -256,12 +309,15 @@ static void benchmark(const Args& args) {
                     pid,
                     "total",
                     total_stats["time_ms"].get<double>(),
-                    static_cast<size_t>(total_stats["total_bytes_sent"].get<uint64_t>()),
-                    static_cast<size_t>(total_stats["total_bytes_recv"].get<uint64_t>()));
+                    static_cast<size_t>(
+                        total_stats["total_bytes_sent"].get<uint64_t>()),
+                    static_cast<size_t>(
+                        total_stats["total_bytes_recv"].get<uint64_t>()));
 
         output_doc["runs"].push_back({
             {"run", run + 1},
-            {"correct", ok},
+            {"correct", runner->isHelper() ? true : ok},
+            {"helper_skip", runner->isHelper()},
             {"offline", offline_stats},
             {"online", online_stats},
             {"total", total_stats}

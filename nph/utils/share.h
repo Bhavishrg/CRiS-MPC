@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstddef>
+#include <memory>
 #include <ostream>
 #include <vector>
 
@@ -84,10 +86,41 @@ struct BeaverTripleShare {
   AdditiveShare<T> c;
 };
 
+/**
+ * Per-shuffle preprocessing material held by one compute party.
+ *
+ * The local permutation is shared across all shuffle gates with the same
+ * perm_group_id.  Therefore this structure stores it through a shared pointer:
+ * gates in the same group point to the same vector instead of duplicating it.
+ *
+ * The masks are fresh for every shuffle gate.
+ */
+template <typename T>
+struct ShuffleGatePreproc {
+  int perm_group_id{-1};
+  size_t vec_size{0};
+
+  // false for kShuffle, true for kUnshuffle.
+  // This is per-gate metadata; the same local_perm can still be reused
+  // across both directions when perm_group_id is the same.
+  bool inverse{false};
+
+  // Local permutation pi_pid used by this compute party in the online
+  // permutation chain.  It is generated during preprocessing and reused for
+  // all gates with the same perm_group_id.
+  std::shared_ptr<const std::vector<size_t>> local_perm;
+
+  // Fresh per-gate preprocessing masks.
+  std::vector<T> opening_mask_share;  // r_i: masks X before reconstruction to P0
+  std::vector<T> chain_mask;          // b_i: masks after this party applies pi_i
+  std::vector<T> delta_share;         // delta_i: correction share removed at output
+};
+
 /** Preprocessing material consumed by the NPH online evaluator. */
 template <typename T>
 struct Preprocessing {
   std::vector<BeaverTripleShare<T>> triples;
+  std::vector<ShuffleGatePreproc<T>> shuffles;
 };
 
 }  // namespace threepc::nph

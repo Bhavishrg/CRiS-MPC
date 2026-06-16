@@ -103,6 +103,17 @@ class OnlineEvaluator {
         static_cast<size_t>(num_compute_parties_));
     std::vector<const FIn2Gate*> mul_gates;
 
+    // Keep permutation gates in consecutive same-kind runs.
+    // Preprocessing is consumed in this exact order, while still allowing
+    // consecutive shuffle/unshuffle gates to be batched cleanly.
+    std::vector<std::pair<GateType, std::vector<const Gate*>>> permutation_runs;
+    auto append_permutation_gate = [&](const Gate* g) {
+      if (permutation_runs.empty() || permutation_runs.back().first != g->type) {
+        permutation_runs.push_back({g->type, {}});
+      }
+      permutation_runs.back().second.push_back(g);
+    };
+
     for (const auto& gp : level) {
       switch (gp->type) {
         case GateType::kInp: {
@@ -121,6 +132,10 @@ class OnlineEvaluator {
         case GateType::kMul:
           mul_gates.push_back(static_cast<const FIn2Gate*>(gp.get()));
           break;
+        case GateType::kShuffle:
+        case GateType::kUnshuffle:
+          append_permutation_gate(gp.get());
+          break;
         default:
           break;
       }
@@ -131,11 +146,29 @@ class OnlineEvaluator {
     batchRecP(recp_by_target);
     batchMul(mul_gates);
 
+    for (const auto& run : permutation_runs) {
+      if (run.first == GateType::kShuffle) {
+        std::vector<const ShuffleGate*> gates;
+        gates.reserve(run.second.size());
+        for (const Gate* g : run.second)
+          gates.push_back(static_cast<const ShuffleGate*>(g));
+        batchShuffle(gates);
+      } else if (run.first == GateType::kUnshuffle) {
+        std::vector<const UnshuffleGate*> gates;
+        gates.reserve(run.second.size());
+        for (const Gate* g : run.second)
+          gates.push_back(static_cast<const UnshuffleGate*>(g));
+        batchUnshuffle(gates);
+      } else {
+        throw std::logic_error("NPH OnlineEvaluator: unexpected permutation run type");
+      }
+    }
+
     for (const auto& local_level : local_sublevels)
       evalLocalSublevel(local_level);
 
     if (idx + 1 == lc.gates_by_level.size())
-      checkAllTriplesConsumed();
+      checkAllPreprocessingConsumed();
   }
 
   EvalOutputs<T> getOutputs(const LevelOrderedCircuit& lc) {
@@ -164,6 +197,7 @@ class OnlineEvaluator {
   std::vector<AdditiveShare<T>> wires_;
   std::unordered_map<wire_t, T> inputs_;
   size_t triple_pos_{0};
+  size_t shuffle_pos_{0};
   bool evaluation_initialized_{false};
 
   int helper_pid() const { return num_compute_parties_; }
@@ -172,12 +206,16 @@ class OnlineEvaluator {
     validateSupported(lc);
     wires_.assign(lc.num_wires, AdditiveShare<T>{});
     triple_pos_ = 0;
+    shuffle_pos_ = 0;
     evaluation_initialized_ = true;
   }
 
-  void checkAllTriplesConsumed() const {
+  void checkAllPreprocessingConsumed() const {
     if (triple_pos_ != preproc_.triples.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused Beaver triples after evaluation");
+    }
+    if (shuffle_pos_ != preproc_.shuffles.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: unused shuffle preprocessing after evaluation");
     }
   }
 
@@ -210,7 +248,17 @@ class OnlineEvaluator {
           case GateType::kCMul:
           case GateType::kMul:
           case GateType::kRec:
+          case GateType::kShuffle:
             break;
+
+          case GateType::kUnshuffle: {
+            const auto& g = static_cast<const UnshuffleGate&>(*gp);
+            if (g.perm_group_id < 0) {
+              throw std::runtime_error(
+                  "NPH protocol: kUnshuffle requires an explicit non-negative perm_group_id");
+            }
+            break;
+          }
 
           case GateType::kRecP: {
             const auto& g = static_cast<const FIn1Gate&>(*gp);
@@ -221,12 +269,9 @@ class OnlineEvaluator {
             break;
           }
 
-          case GateType::kShuffle:
-          case GateType::kUnshuffle:
           case GateType::kLocalPerm:
             throw std::runtime_error(
-                "NPH protocol: this gate type is not implemented yet "
-                "(shuffle/unshuffle/local permutation)");
+                "NPH protocol: kLocalPerm is not implemented yet");
 
           default:
             throw std::runtime_error("NPH protocol: unknown or invalid gate type");
@@ -416,6 +461,253 @@ class OnlineEvaluator {
     }
 
     return result;
+  }
+
+
+  static std::vector<T> applyPerm(const std::vector<size_t>& perm,
+                                  const std::vector<T>& v) {
+    if (perm.size() != v.size()) {
+      throw std::invalid_argument("NPH OnlineEvaluator::applyPerm: size mismatch");
+    }
+    std::vector<T> out(perm.size());
+    for (size_t i = 0; i < perm.size(); ++i) {
+      if (perm[i] >= v.size()) {
+        throw std::runtime_error("NPH OnlineEvaluator::applyPerm: index out of range");
+      }
+      // Pull convention: out[i] = v[perm[i]].
+      out[i] = v[perm[i]];
+    }
+    return out;
+  }
+
+  static std::vector<T> applyInversePerm(const std::vector<size_t>& perm,
+                                         const std::vector<T>& v) {
+    if (perm.size() != v.size()) {
+      throw std::invalid_argument("NPH OnlineEvaluator::applyInversePerm: size mismatch");
+    }
+    std::vector<T> out(perm.size());
+    for (size_t i = 0; i < perm.size(); ++i) {
+      if (perm[i] >= v.size()) {
+        throw std::runtime_error("NPH OnlineEvaluator::applyInversePerm: index out of range");
+      }
+      // Inverse of out[i] = v[perm[i]] is out[perm[i]] = v[i].
+      out[perm[i]] = v[i];
+    }
+    return out;
+  }
+
+  void batchShuffle(const std::vector<const ShuffleGate*>& gates) {
+    if (gates.empty()) return;
+
+    const size_t G = gates.size();
+    if (shuffle_pos_ + G > preproc_.shuffles.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: not enough shuffle preprocessing");
+    }
+
+    std::vector<const ShuffleGatePreproc<T>*> pps(G, nullptr);
+    size_t total_elems = 0;
+
+    for (size_t gi = 0; gi < G; ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = preproc_.shuffles[shuffle_pos_ + gi];
+      const size_t n = g.ins.size();
+
+      if (n == 0 || g.outs.size() != n) {
+        throw std::runtime_error("NPH batchShuffle: malformed shuffle gate");
+      }
+      if (pp.inverse) {
+        throw std::runtime_error("NPH batchShuffle: preprocessing is for unshuffle");
+      }
+      if (pp.vec_size != n || pp.perm_group_id != g.perm_group_id ||
+          pp.opening_mask_share.size() != n || pp.chain_mask.size() != n ||
+          pp.delta_share.size() != n) {
+        throw std::runtime_error("NPH batchShuffle: preprocessing mismatch");
+      }
+      if (!pp.local_perm || pp.local_perm->size() != n) {
+        throw std::runtime_error("NPH batchShuffle: missing local permutation");
+      }
+
+      pps[gi] = &pp;
+      total_elems += n;
+    }
+
+    // Step 1. Mask input shares and reconstruct X + R to P0, which owns the
+    // first local permutation in the forward shuffle chain.
+    std::vector<T> masked(total_elems, T{});
+    size_t offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+      for (size_t j = 0; j < n; ++j)
+        masked[offset + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      offset += n;
+    }
+
+    std::vector<T> chain_value = reconstructTo(masked, 0);
+
+    // Step 2. Run the forward chain:
+    //   P0 -> P1 -> ... -> P(n-1), applying pi_i and adding b_i.
+    const int last = num_compute_parties_ - 1;
+    if (pid_ == 0) {
+      applyShuffleStep(gates, pps, chain_value);
+      if (last != 0) {
+        net_.send_ring<T>(chain_value.data(), chain_value.size(), 1);
+        net_.flush(1);
+      }
+    } else {
+      chain_value.assign(total_elems, T{});
+      net_.recv_ring<T>(chain_value.data(), chain_value.size(), pid_ - 1);
+      applyShuffleStep(gates, pps, chain_value);
+      if (pid_ != last) {
+        net_.send_ring<T>(chain_value.data(), chain_value.size(), pid_ + 1);
+        net_.flush(pid_ + 1);
+      }
+    }
+
+    // Step 3. Convert the final masked value into additive shares.  Only the
+    // last party holds the masked chain value; everyone subtracts its delta
+    // share.
+    offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.outs.size();
+      for (size_t j = 0; j < n; ++j) {
+        T out_share = T{} - pp.delta_share[j];
+        if (pid_ == last)
+          out_share = chain_value[offset + j] - pp.delta_share[j];
+        wires_[g.outs[j]] = AdditiveShare<T>(out_share);
+      }
+      offset += n;
+    }
+
+    shuffle_pos_ += G;
+  }
+
+  void batchUnshuffle(const std::vector<const UnshuffleGate*>& gates) {
+    if (gates.empty()) return;
+
+    const size_t G = gates.size();
+    if (shuffle_pos_ + G > preproc_.shuffles.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: not enough unshuffle preprocessing");
+    }
+
+    std::vector<const ShuffleGatePreproc<T>*> pps(G, nullptr);
+    size_t total_elems = 0;
+
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = preproc_.shuffles[shuffle_pos_ + gi];
+      const size_t n = g.ins.size();
+
+      if (n == 0 || g.outs.size() != n) {
+        throw std::runtime_error("NPH batchUnshuffle: malformed unshuffle gate");
+      }
+      if (!pp.inverse) {
+        throw std::runtime_error("NPH batchUnshuffle: preprocessing is for shuffle");
+      }
+      if (pp.vec_size != n || pp.perm_group_id != g.perm_group_id ||
+          pp.opening_mask_share.size() != n || pp.chain_mask.size() != n ||
+          pp.delta_share.size() != n) {
+        throw std::runtime_error("NPH batchUnshuffle: preprocessing mismatch");
+      }
+      if (!pp.local_perm || pp.local_perm->size() != n) {
+        throw std::runtime_error("NPH batchUnshuffle: missing local permutation");
+      }
+
+      pps[gi] = &pp;
+      total_elems += n;
+    }
+
+    const int last = num_compute_parties_ - 1;
+
+    // Step 1. Mask input shares and reconstruct X + R to P(n-1), which owns
+    // the first inverse permutation in the unshuffle chain.
+    std::vector<T> masked(total_elems, T{});
+    size_t offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+      for (size_t j = 0; j < n; ++j)
+        masked[offset + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      offset += n;
+    }
+
+    std::vector<T> chain_value = reconstructTo(masked, last);
+
+    // Step 2. Run the reverse chain:
+    //   P(n-1) -> ... -> P1 -> P0, applying pi_i^{-1} and adding b_i.
+    if (pid_ == last) {
+      applyUnshuffleStep(gates, pps, chain_value);
+      if (last != 0) {
+        net_.send_ring<T>(chain_value.data(), chain_value.size(), last - 1);
+        net_.flush(last - 1);
+      }
+    } else {
+      chain_value.assign(total_elems, T{});
+      net_.recv_ring<T>(chain_value.data(), chain_value.size(), pid_ + 1);
+      applyUnshuffleStep(gates, pps, chain_value);
+      if (pid_ != 0) {
+        net_.send_ring<T>(chain_value.data(), chain_value.size(), pid_ - 1);
+        net_.flush(pid_ - 1);
+      }
+    }
+
+    // Step 3. Convert the final masked value into additive shares.  Only P0
+    // holds the masked chain value after unshuffle.
+    offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.outs.size();
+      for (size_t j = 0; j < n; ++j) {
+        T out_share = T{} - pp.delta_share[j];
+        if (pid_ == 0)
+          out_share = chain_value[offset + j] - pp.delta_share[j];
+        wires_[g.outs[j]] = AdditiveShare<T>(out_share);
+      }
+      offset += n;
+    }
+
+    shuffle_pos_ += G;
+  }
+
+  void applyShuffleStep(const std::vector<const ShuffleGate*>& gates,
+                        const std::vector<const ShuffleGatePreproc<T>*>& pps,
+                        std::vector<T>& flat) const {
+    size_t offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+
+      std::vector<T> slice(flat.begin() + static_cast<std::ptrdiff_t>(offset),
+                           flat.begin() + static_cast<std::ptrdiff_t>(offset + n));
+      slice = applyPerm(*pp.local_perm, slice);
+      for (size_t j = 0; j < n; ++j)
+        flat[offset + j] = slice[j] + pp.chain_mask[j];
+      offset += n;
+    }
+  }
+
+  void applyUnshuffleStep(const std::vector<const UnshuffleGate*>& gates,
+                          const std::vector<const ShuffleGatePreproc<T>*>& pps,
+                          std::vector<T>& flat) const {
+    size_t offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+
+      std::vector<T> slice(flat.begin() + static_cast<std::ptrdiff_t>(offset),
+                           flat.begin() + static_cast<std::ptrdiff_t>(offset + n));
+      slice = applyInversePerm(*pp.local_perm, slice);
+      for (size_t j = 0; j < n; ++j)
+        flat[offset + j] = slice[j] + pp.chain_mask[j];
+      offset += n;
+    }
   }
 
   void batchMul(const std::vector<const FIn2Gate*>& gates) {
