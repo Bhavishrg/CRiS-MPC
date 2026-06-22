@@ -248,6 +248,8 @@ class OnlineEvaluator {
         case GateType::kUnshuffle:
           unshuffle_gates.push_back(static_cast<const UnshuffleGate*>(gp.get()));
           break;
+        case GateType::kPermSh:
+          throw std::runtime_error("3PC OnlineEvaluator: kPermSh is only supported by NPH");
         default:
           break;
       }

@@ -216,6 +216,32 @@ class Circuit {
     return outs;
   }
 
+  // ── PermSh gate: kPermSh ────────────────────────────────────────────────
+
+  /**
+   * NPH-only target-party random permutation shuffle.
+   *
+   * The preprocessing helper and `target` sample a hidden permutation pi.
+   * Online evaluation reconstructs only X + R to `target`; target applies pi,
+   * and all parties subtract their shares of pi(R), producing shares of pi(X).
+   *
+   * Gates sharing the same non-negative `perm_group_id` reuse the same hidden
+   * permutation if they also have the same target and vector size.
+   */
+  std::vector<wire_t> addPermShGate(const std::vector<wire_t>& ins,
+                                    int target,
+                                    int perm_group_id = -1) {
+    if (ins.empty())
+      throw std::invalid_argument("addPermShGate: ins must be non-empty");
+    if (target < 0)
+      throw std::invalid_argument("addPermShGate: target must be non-negative");
+    for (wire_t w : ins) checkWire(w);
+    std::vector<wire_t> outs(ins.size());
+    for (wire_t& w : outs) w = num_wires_++;
+    gates_.push_back(std::make_shared<PermShGate>(ins, outs, target, perm_group_id));
+    return outs;
+  }
+
   // ── LocalPerm gate: kLocalPerm ────────────────────────────────────────
 
   /**
@@ -1175,6 +1201,12 @@ class Circuit {
           wdepth[w] = d;
           wlocal_rank[w] = 0;
         }
+      } else if (gp->type == GateType::kPermSh) {
+        const auto& pg = static_cast<const PermShGate&>(*gp);
+        for (wire_t w : pg.outs) {
+          wdepth[w] = d;
+          wlocal_rank[w] = 0;
+        }
       } else if (gp->type == GateType::kLocalPerm) {
         const auto& lg = static_cast<const LocalPermGate&>(*gp);
         for (wire_t w : lg.outs) {
@@ -1225,7 +1257,8 @@ class Circuit {
            t == GateType::kRec     ||
            t == GateType::kRecP    ||
            t == GateType::kShuffle ||
-           t == GateType::kUnshuffle;
+           t == GateType::kUnshuffle ||
+           t == GateType::kPermSh;
   }
 
   static bool isLocal(GateType t) {
@@ -1319,6 +1352,15 @@ class Circuit {
         size_t d = 0;
         for (wire_t w : ug.ins) d = std::max(d, wdepth[w]);
         return d + 2;
+      }
+
+      case GateType::kPermSh: {
+        // Reconstruct X + R to the target in one round; target locally applies
+        // pi and all parties subtract shares of pi(R).
+        const auto& pg = static_cast<const PermShGate&>(g);
+        size_t d = 0;
+        for (wire_t w : pg.ins) d = std::max(d, wdepth[w]);
+        return d + 1;
       }
 
       case GateType::kLocalPerm: {

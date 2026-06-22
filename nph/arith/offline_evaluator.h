@@ -28,6 +28,7 @@ namespace threepc::nph {
  *
  *   1. Beaver triples for kMul gates.
  *   2. Shuffle/unshuffle preprocessing for kShuffle and kUnshuffle gates.
+ *   3. Target-party permutation shuffle preprocessing for kPermSh gates.
  *
  * For multiplication, the helper communicates only the missing c-share to the
  * last compute party.  Shares of a and b, and all other c-shares, are sampled
@@ -62,15 +63,18 @@ class OfflineEvaluator {
     const size_t num_triples =
         lc.count[static_cast<size_t>(GateType::kMul)];
     const std::vector<const Gate*> shuffle_gates = collectPermutationGates(lc);
+    const std::vector<const PermShGate*> permsh_gates = collectPermShGates(lc);
 
     preproc_.triples.clear();
     preproc_.shuffles.clear();
+    preproc_.permsh.clear();
 
     if (is_helper()) {
       if (num_triples != 0) helperGenerateTriples(num_triples);
     } else {
       preproc_.triples.resize(num_triples);
       preproc_.shuffles.reserve(shuffle_gates.size());
+      preproc_.permsh.reserve(permsh_gates.size());
 
       if (num_triples != 0) computeGenerateTriples(num_triples);
     }
@@ -79,6 +83,7 @@ class OfflineEvaluator {
     // side computes the global correction and sends the missing final share;
     // compute parties derive/store their local ShuffleGatePreproc entries.
     if (!shuffle_gates.empty()) generateShuffles(shuffle_gates);
+    if (!permsh_gates.empty()) generatePermShuffles(permsh_gates);
   }
 
   Preprocessing<T> take_preprocessing() { return std::move(preproc_); }
@@ -95,6 +100,14 @@ class OfflineEvaluator {
 
     // Used by compute parties: local_perm is this party's pi_pid.
     // All gates with the same perm_group_id point to the same vector.
+    std::shared_ptr<const std::vector<size_t>> local_perm;
+  };
+
+  struct PermShPermGroup {
+    size_t vec_size{0};
+    int target{-1};
+
+    std::vector<size_t> helper_perm;
     std::shared_ptr<const std::vector<size_t>> local_perm;
   };
 
@@ -215,6 +228,19 @@ class OfflineEvaluator {
     return gates;
   }
 
+  static std::vector<const PermShGate*> collectPermShGates(
+      const LevelOrderedCircuit& lc) {
+    std::vector<const PermShGate*> gates;
+    for (const auto& level : lc.gates_by_level) {
+      for (const auto& gp : level) {
+        if (gp->type == GateType::kPermSh) {
+          gates.push_back(static_cast<const PermShGate*>(gp.get()));
+        }
+      }
+    }
+    return gates;
+  }
+
   void validateSupported(const LevelOrderedCircuit& lc) const {
     for (const auto& level : lc.gates_by_level) {
       for (const auto& gp : level) {
@@ -238,6 +264,18 @@ class OfflineEvaluator {
           case GateType::kRec:
           case GateType::kShuffle:
             break;
+
+          case GateType::kPermSh: {
+            const auto& g = static_cast<const PermShGate&>(*gp);
+            if (g.target < 0 || g.target >= num_compute_parties_) {
+              throw std::runtime_error(
+                  "NPH protocol: kPermSh target must be a compute party in 0..n-1");
+            }
+            if (g.ins.empty() || g.outs.size() != g.ins.size()) {
+              throw std::runtime_error("NPH protocol: malformed kPermSh gate");
+            }
+            break;
+          }
 
           case GateType::kUnshuffle: {
             const auto& g = static_cast<const UnshuffleGate&>(*gp);
@@ -436,6 +474,86 @@ class OfflineEvaluator {
     return group->local_perm;
   }
 
+  PermShPermGroup makeFreshPermShPermGroup(size_t n, int target) {
+    PermShPermGroup group;
+    group.vec_size = n;
+    group.target = target;
+
+    if (is_helper()) {
+      group.helper_perm = samplePermutationWithParty(target, n);
+    } else if (pid_ == target) {
+      group.local_perm = std::make_shared<std::vector<size_t>>(
+          samplePermutationWithParty(helper_pid(), n));
+    }
+
+    return group;
+  }
+
+  PermShPermGroup& getOrCreatePermShPermGroup(
+      int gid,
+      size_t n,
+      int target,
+      std::unordered_map<int, PermShPermGroup>& cache) {
+    auto it = cache.find(gid);
+    if (it != cache.end()) {
+      if (it->second.vec_size != n || it->second.target != target) {
+        throw std::runtime_error(
+            "NPH kPermSh preprocessing: same perm_group_id reused with different size or target");
+      }
+      return it->second;
+    }
+
+    auto inserted = cache.emplace(gid, makeFreshPermShPermGroup(n, target));
+    return inserted.first->second;
+  }
+
+  const std::vector<size_t>& helperPermShPermutation(
+      const PermShGate& gate,
+      std::unordered_map<int, PermShPermGroup>& cache,
+      PermShPermGroup& fresh_group) {
+    const size_t n = gate.ins.size();
+    PermShPermGroup* group = nullptr;
+    if (gate.perm_group_id >= 0) {
+      group = &getOrCreatePermShPermGroup(gate.perm_group_id, n, gate.target, cache);
+    } else {
+      if (fresh_group.vec_size == 0)
+        fresh_group = makeFreshPermShPermGroup(n, gate.target);
+      group = &fresh_group;
+    }
+
+    if (!is_helper()) {
+      throw std::logic_error("NPH kPermSh preprocessing: helper permutation is helper-only");
+    }
+    if (group->helper_perm.size() != n) {
+      throw std::runtime_error("NPH kPermSh preprocessing: missing helper permutation");
+    }
+    return group->helper_perm;
+  }
+
+  std::shared_ptr<const std::vector<size_t>> localPermShPermutation(
+      const PermShGate& gate,
+      std::unordered_map<int, PermShPermGroup>& cache,
+      PermShPermGroup& fresh_group) {
+    const size_t n = gate.ins.size();
+    PermShPermGroup* group = nullptr;
+    if (gate.perm_group_id >= 0) {
+      group = &getOrCreatePermShPermGroup(gate.perm_group_id, n, gate.target, cache);
+    } else {
+      if (fresh_group.vec_size == 0)
+        fresh_group = makeFreshPermShPermGroup(n, gate.target);
+      group = &fresh_group;
+    }
+
+    if (is_helper()) {
+      throw std::logic_error("NPH kPermSh preprocessing: local permutation is compute-only");
+    }
+    if (pid_ != gate.target) return nullptr;
+    if (!group->local_perm) {
+      throw std::runtime_error("NPH kPermSh preprocessing: missing target permutation");
+    }
+    return group->local_perm;
+  }
+
   void generateShuffles(const std::vector<const Gate*>& gates) {
     const int helper = helper_pid();
     const int last = last_compute_pid();
@@ -586,6 +704,107 @@ class OfflineEvaluator {
     if (is_helper()) {
       for (int p = 0; p < num_compute_parties_; ++p) {
         const auto& buf = missing_delta_flat[static_cast<size_t>(p)];
+        if (!buf.empty()) {
+          net_.send_ring<T>(buf.data(), buf.size(), p);
+          net_.flush(p);
+        }
+      }
+    }
+  }
+
+  void generatePermShuffles(const std::vector<const PermShGate*>& gates) {
+    const int helper = helper_pid();
+
+    std::vector<size_t> missing_elems(static_cast<size_t>(num_compute_parties_), 0);
+    for (const auto* g : gates) {
+      missing_elems[static_cast<size_t>(g->target)] += g->ins.size();
+    }
+
+    std::vector<std::vector<T>> missing_flat(static_cast<size_t>(num_compute_parties_));
+    std::vector<T> received_missing;
+
+    if (is_helper()) {
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        missing_flat[static_cast<size_t>(p)].reserve(missing_elems[static_cast<size_t>(p)]);
+      }
+    } else {
+      const size_t my_missing = missing_elems[static_cast<size_t>(pid_)];
+      if (my_missing != 0) {
+        received_missing.resize(my_missing);
+        net_.recv_ring<T>(received_missing.data(), received_missing.size(), helper);
+      }
+    }
+
+    std::unordered_map<int, PermShPermGroup> perm_cache;
+    size_t received_offset = 0;
+
+    for (const PermShGate* gate_ptr : gates) {
+      const PermShGate& gate = *gate_ptr;
+      const size_t n = gate.ins.size();
+      if (n == 0 || gate.outs.size() != n) {
+        throw std::runtime_error("NPH kPermSh preprocessing: malformed gate");
+      }
+
+      PermShPermGroup fresh_group;
+
+      if (is_helper()) {
+        const std::vector<size_t>& pi =
+            helperPermShPermutation(gate, perm_cache, fresh_group);
+
+        std::vector<T> R(n, T{});
+        for (int p = 0; p < num_compute_parties_; ++p) {
+          const std::vector<T> r_p = sampleVectorWithParty(p, n);
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            R[j] += r_p[j];
+          }
+        }
+
+        const std::vector<T> pi_R = applyPerm(pi, R);
+        std::vector<T> pi_R_sum(n, T{});
+        for (int p = 0; p < num_compute_parties_; ++p) {
+          if (p == gate.target) continue;
+          const std::vector<T> share_p = sampleVectorWithParty(p, n);
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            pi_R_sum[j] += share_p[j];
+          }
+        }
+
+        auto& missing = missing_flat[static_cast<size_t>(gate.target)];
+        const size_t base = missing.size();
+        missing.resize(base + n);
+        #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+          const size_t j = static_cast<size_t>(jj);
+          missing[base + j] = pi_R[j] - pi_R_sum[j];
+        }
+      } else {
+        PermShGatePreproc<T> pp;
+        pp.target = gate.target;
+        pp.perm_group_id = gate.perm_group_id;
+        pp.vec_size = n;
+        pp.local_perm = localPermShPermutation(gate, perm_cache, fresh_group);
+        pp.opening_mask_share = sampleVectorWithParty(helper, n);
+
+        if (pid_ == gate.target) {
+          pp.permuted_mask_share.assign(
+              received_missing.begin() + static_cast<std::ptrdiff_t>(received_offset),
+              received_missing.begin() + static_cast<std::ptrdiff_t>(received_offset + n));
+          received_offset += n;
+        } else {
+          pp.permuted_mask_share = sampleVectorWithParty(helper, n);
+        }
+
+        preproc_.permsh.push_back(std::move(pp));
+      }
+    }
+
+    if (is_helper()) {
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        const auto& buf = missing_flat[static_cast<size_t>(p)];
         if (!buf.empty()) {
           net_.send_ring<T>(buf.data(), buf.size(), p);
           net_.flush(p);

@@ -116,11 +116,29 @@ struct ShuffleGatePreproc {
   std::vector<T> delta_share;         // delta_i: correction share removed at output
 };
 
+/**
+ * Per-kPermSh preprocessing material held by one compute party.
+ *
+ * Only the target party stores local_perm.  Every compute party stores its
+ * additive share of R and of pi(R).
+ */
+template <typename T>
+struct PermShGatePreproc {
+  int target{-1};
+  int perm_group_id{-1};
+  size_t vec_size{0};
+
+  std::shared_ptr<const std::vector<size_t>> local_perm;
+  std::vector<T> opening_mask_share;   // party share of R
+  std::vector<T> permuted_mask_share;  // party share of pi(R)
+};
+
 /** Preprocessing material consumed by the NPH online evaluator. */
 template <typename T>
 struct Preprocessing {
   std::vector<BeaverTripleShare<T>> triples;
   std::vector<ShuffleGatePreproc<T>> shuffles;
+  std::vector<PermShGatePreproc<T>> permsh;
 };
 
 }  // namespace threepc::nph

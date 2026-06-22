@@ -19,6 +19,7 @@ enum class GateType {
   kRecP,    // interactive: reconstruct to `target` party only
   kShuffle,    // interactive: secretly apply grouped/random shuffle permutation
   kUnshuffle,  // interactive: apply inverse of a grouped shuffle permutation
+  kPermSh,      // interactive: target-party random permutation shuffle
   kLocalPerm,   // local:       permute payload wires by index wires (no communication)
   kInvalid,
   NumGates
@@ -125,6 +126,30 @@ struct UnshuffleGate : public Gate {
       : Gate{GateType::kUnshuffle, outs.empty() ? 0 : outs[0]},
         ins{std::move(ins)}, outs{std::move(outs)},
         perm_group_id{perm_group_id} {}
+};
+
+// ── PermSh gate: kPermSh ─────────────────────────────────────────────────────
+// NPH-only gate that applies a hidden random permutation sampled by one target
+// compute party and the preprocessing helper.
+//
+// The target learns the masked value X + R, applies its local permutation pi,
+// and all parties subtract their additive shares of pi(R).  The output is an
+// additive sharing of pi(X), while only the target knows pi.
+//
+// perm_group_id: if >= 0, kPermSh gates with the same target, group id, and
+// vector size reuse the same target-party permutation.  -1 means fresh.
+struct PermShGate : public Gate {
+  std::vector<wire_t> ins;
+  std::vector<wire_t> outs;
+  int target{-1};
+  int perm_group_id{-1};
+
+  PermShGate() : Gate{GateType::kPermSh, 0} {}
+  PermShGate(std::vector<wire_t> ins, std::vector<wire_t> outs,
+             int target, int perm_group_id = -1)
+      : Gate{GateType::kPermSh, outs.empty() ? 0 : outs[0], target},
+        ins{std::move(ins)}, outs{std::move(outs)},
+        target{target}, perm_group_id{perm_group_id} {}
 };
 
 // ── LocalPerm gate: kLocalPerm ───────────────────────────────────────────────

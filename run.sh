@@ -22,6 +22,7 @@ if [ $# -lt 1 ]; then
     echo "  - bench_gate"
     echo "  - bench_linear"
     echo "  - bench_mult"
+    echo "  - bench_permsh"
     echo "  - bench_propagate"
     echo "  - bench_unshuffle"
     echo "  - bench_sort"
@@ -45,7 +46,7 @@ normalize_benchmark_args() {
     local -a normalized=("$@")
 
     case "$benchmark_name" in
-        bench_mult|bench_linear|bench_gate|bench_unshuffle)
+        bench_mult|bench_linear|bench_gate|bench_permsh|bench_unshuffle)
             if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
                 normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
             fi
