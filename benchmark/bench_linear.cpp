@@ -40,10 +40,10 @@
 //   x is owned by P0.
 //   y is owned by P1.
 
-#include "3pc/arith/offline_evaluator.h"
-#include "3pc/arith/online_evaluator.h"
-#include "common/circuit/circuit.h"
-#include "3pc/net/net3p.h"
+#include "src/3pc/arith/offline_evaluator.h"
+#include "src/3pc/arith/online_evaluator.h"
+#include "src/common/circuit/circuit.h"
+#include "src/3pc/net/net3p.h"
 #include "benchmark/utils.h"
 
 #include <algorithm>

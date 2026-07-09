@@ -1,5 +1,6 @@
 # Tests for SS_PSI/3pc
-# The PSI root is on the include path so headers can be reached via "3pc/..." includes.
+# The PSI root is on the include path so headers can be reached via
+# "src/3pc/..." and "src/nph/..." includes.
 
 # ── 3PC RSS tests ─────────────────────────────────────────────────────────────
 add_executable(test_shuffle3p test_shuffle3p.cpp)

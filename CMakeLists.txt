@@ -26,7 +26,7 @@ if(NOT TARGET emp-tool::emp-tool)
     INTERFACE_LINK_LIBRARIES      "${EMP-TOOL_LIBRARIES}")
 endif()
 
-# ── PSI include root (so code can #include "3pc/...") ─────────────────────
+# ── PSI include root (so code can #include "src/3pc/...") ─────────────────────
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
 # ── nlohmann/json (used by benchmark/utils.h) ────────────────────────────────
@@ -34,9 +34,10 @@ include(FetchContent)
 FetchContent_Declare(
   nlohmann_json
   URL      https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
-  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d)
+  URL_HASH SHA256=d6c65aca6b1ed68e7a182f4757257b107ae403032760ed6ef121c9d55e81757d
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(nlohmann_json)
 
-add_subdirectory(3pc)
+add_subdirectory(src/3pc)
 add_subdirectory(test)
 add_subdirectory(benchmark)

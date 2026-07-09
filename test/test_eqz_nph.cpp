@@ -6,10 +6,10 @@
 //   ./test_eqz_nph 2 127.0.0.1 [--pking]
 //   ./test_eqz_nph 3 127.0.0.1 [--pking]
 
-#include "common/circuit/circuit.h"
-#include "nph/arith/offline_evaluator.h"
-#include "nph/arith/online_evaluator.h"
-#include "nph/net/net_np.h"
+#include "src/common/circuit/circuit.h"
+#include "src/nph/arith/offline_evaluator.h"
+#include "src/nph/arith/online_evaluator.h"
+#include "src/nph/net/net_np.h"
 
 #include <cstdio>
 #include <cstdlib>

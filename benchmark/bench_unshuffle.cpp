@@ -21,9 +21,9 @@
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000 --pking
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 2 --vec-size 1000 --disable-optimized-shuffle
 
-#include "common/circuit/circuit.h"
+#include "src/common/circuit/circuit.h"
 #include "benchmark/utils.h"
-#include "common/protocol_runner.h"
+#include "src/common/protocol_runner.h"
 
 #include <algorithm>
 #include <cinttypes>

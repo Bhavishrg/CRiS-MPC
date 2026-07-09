@@ -4,7 +4,7 @@
 #include <memory>
 #include <vector>
 
-#include "nph/utils/share.h"
+#include "src/nph/utils/share.h"
 
 namespace threepc::nph {
 

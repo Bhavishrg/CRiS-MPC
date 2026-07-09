@@ -1,14 +1,14 @@
 #pragma once
 
-#include "3pc/arith/offline_evaluator.h"
-#include "3pc/arith/online_evaluator.h"
-#include "common/circuit/circuit.h"
-#include "3pc/net/net3p.h"
-#include "nph/arith/offline_evaluator.h"
-#include "nph/arith/online_evaluator.h"
-#include "nph/net/net_np.h"
-#include "nph/utils/preproc.h"
-#include "nph/utils/prg_np.h"
+#include "src/3pc/arith/offline_evaluator.h"
+#include "src/3pc/arith/online_evaluator.h"
+#include "src/common/circuit/circuit.h"
+#include "src/3pc/net/net3p.h"
+#include "src/nph/arith/offline_evaluator.h"
+#include "src/nph/arith/online_evaluator.h"
+#include "src/nph/net/net_np.h"
+#include "src/nph/utils/preproc.h"
+#include "src/nph/utils/prg_np.h"
 
 #include <algorithm>
 #include <cstdint>

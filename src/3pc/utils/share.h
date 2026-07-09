@@ -1,7 +1,7 @@
 #pragma once
 
-#include "3pc/utils/types.h"
-#include "3pc/net/net3p.h"
+#include "src/3pc/utils/types.h"
+#include "src/3pc/net/net3p.h"
 #include <emp-tool/emp-tool.h>  // emp::PRG
 
 namespace threepc {

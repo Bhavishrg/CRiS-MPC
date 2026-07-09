@@ -25,10 +25,10 @@
 // If vec_size < 10 or num_groups < 3, the benchmark falls back to identity
 // permutation.
 
-#include "3pc/arith/offline_evaluator.h"
-#include "3pc/arith/online_evaluator.h"
-#include "common/circuit/circuit.h"
-#include "3pc/net/net3p.h"
+#include "src/3pc/arith/offline_evaluator.h"
+#include "src/3pc/arith/online_evaluator.h"
+#include "src/common/circuit/circuit.h"
+#include "src/3pc/net/net3p.h"
 #include "benchmark/utils.h"
 
 #include <algorithm>

@@ -5,10 +5,10 @@
 //   ./test_shuffle_nph_2p 1 127.0.0.1
 //   ./test_shuffle_nph_2p 2 127.0.0.1
 
-#include "common/circuit/circuit.h"
-#include "nph/arith/offline_evaluator.h"
-#include "nph/arith/online_evaluator.h"
-#include "nph/net/net_np.h"
+#include "src/common/circuit/circuit.h"
+#include "src/nph/arith/offline_evaluator.h"
+#include "src/nph/arith/online_evaluator.h"
+#include "src/nph/net/net_np.h"
 
 #include <algorithm>
 #include <cstdint>

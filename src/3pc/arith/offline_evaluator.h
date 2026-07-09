@@ -1,8 +1,8 @@
 #pragma once
 
-#include "common/circuit/circuit.h"
-#include "3pc/utils/prg3p.h"
-#include "3pc/net/net3p.h"
+#include "src/common/circuit/circuit.h"
+#include "src/3pc/utils/prg3p.h"
+#include "src/3pc/net/net3p.h"
 #include <cstddef>
 
 namespace threepc {

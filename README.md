@@ -11,31 +11,33 @@ CRiS-MPC is intended for research and benchmarking.
 
 ```text
 CRiS-MPC/
-├── 3pc/
-│   ├── arith/
-│   │   ├── offline_evaluator.h
-│   │   └── online_evaluator.h
-│   ├── utils/
-│   │   ├── prg3p.h
-│   │   ├── share.h
-│   │   └── types.h
-│   └── net/
-│       └── net3p.h
-├── common/
-│   ├── circuit/
-│   │   ├── circuit.h
-│   │   └── gate.h
-│   ├── protocol_runner.h
-│   └── types.h
-├── nph/
-│   ├── arith/
-│   │   ├── offline_evaluator.h
-│   │   └── online_evaluator.h
-│   ├── net/
-│   │   └── net_np.h
-│   └── utils/
-│       ├── prg_np.h
-│       ├── share.h
+├── src/
+│   ├── 3pc/
+│   │   ├── arith/
+│   │   │   ├── offline_evaluator.h
+│   │   │   └── online_evaluator.h
+│   │   ├── utils/
+│   │   │   ├── prg3p.h
+│   │   │   ├── share.h
+│   │   │   └── types.h
+│   │   └── net/
+│   │       └── net3p.h
+│   ├── nph/
+│       ├── arith/
+│       │   ├── offline_evaluator.h
+│       │   └── online_evaluator.h
+│       ├── net/
+│       │   └── net_np.h
+│       └── utils/
+│           ├── preproc.h
+│           ├── prg_np.h
+│           ├── share.h
+│           └── types.h
+│   └── common/
+│       ├── circuit/
+│       │   ├── circuit.h
+│       │   └── gate.h
+│       ├── protocol_runner.h
 │       └── types.h
 ├── benchmark/
 │   ├── bench_gate.cpp

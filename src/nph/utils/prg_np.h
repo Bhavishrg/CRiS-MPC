@@ -1,6 +1,6 @@
 #pragma once
 
-#include "nph/net/net_np.h"
+#include "src/nph/net/net_np.h"
 
 #include <emp-tool/emp-tool.h>
 
