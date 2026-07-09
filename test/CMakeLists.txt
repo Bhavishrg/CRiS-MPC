@@ -5,3 +5,5 @@
 add_executable(test_shuffle3p test_shuffle3p.cpp)
 target_link_libraries(test_shuffle3p PRIVATE emp-tool::emp-tool)
 
+add_executable(test_eqz_nph test_eqz_nph.cpp)
+target_link_libraries(test_eqz_nph PRIVATE emp-tool::emp-tool)

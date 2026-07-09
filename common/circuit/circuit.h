@@ -114,18 +114,20 @@ class Circuit {
     return out;
   }
 
-  // ── Single-input gate: kRec, kRecP ─────────────────────────────
+  // ── Single-input gate: kEqz, kRec, kRecP ─────────────────────────────
 
   /*
    *
+   *   addGate(kEqz, in)         — output is a shared 1 iff input is zero
    *   addGate(kRec,  in)         — all parties reconstruct
    *   addGate(kRecP, in, target) — only `target` learns the plaintext
    *
    * `owner` is ignored for kRec; it specifies the target party for kRecP.
    */
   wire_t addGate(GateType type, wire_t in, int owner = -1) {
-    if (type != GateType::kRec && type != GateType::kRecP)
-      throw std::invalid_argument("Circuit::addGate(1-input): expected kRec or kRecP");
+    if (type != GateType::kEqz && type != GateType::kRec &&
+        type != GateType::kRecP)
+      throw std::invalid_argument("Circuit::addGate(1-input): expected kEqz, kRec, or kRecP");
     if (type == GateType::kRecP && owner < 0)
       throw std::invalid_argument("Circuit::addGate(kRecP): target party must be >= 0");
     checkWire(in);
@@ -135,6 +137,15 @@ class Circuit {
   }
 
   // ── Named aliases (delegate to the overload above) ────────────────────────
+
+  /// kEqz — output is a shared 1 iff `in` is zero, otherwise shared 0.
+  wire_t addEqzGate(wire_t in)           { return addGate(GateType::kEqz, in); }
+
+  /// Equality convenience: returns shared 1 iff lhs == rhs.
+  wire_t addEqGate(wire_t lhs, wire_t rhs) {
+    wire_t diff = addGate(GateType::kSub, lhs, rhs);
+    return addEqzGate(diff);
+  }
 
   /// kRec — all three parties reconstruct and learn the plaintext.
   wire_t addRecGate(wire_t in)            { return addGate(GateType::kRec,  in); }
@@ -1154,7 +1165,8 @@ class Circuit {
    * Topologically sort gates by multiplicative depth and return a
    * LevelOrderedCircuit ready for the evaluator.
    *
-   * Interactive gates (kMul, kRec, kRecP) increment depth by 1.
+   * Interactive gates increment depth by the number of communication rounds
+   * needed before their outputs are available.
    * Local gates inherit the max depth of their inputs.
    *
    * Gates are added in topological order by construction (each gate's output
@@ -1254,6 +1266,7 @@ class Circuit {
 
   static bool isInteractive(GateType t) {
     return t == GateType::kMul     ||
+           t == GateType::kEqz     ||
            t == GateType::kRec     ||
            t == GateType::kRecP    ||
            t == GateType::kShuffle ||
@@ -1335,6 +1348,14 @@ class Circuit {
       case GateType::kRecP: {
         const auto& g1 = static_cast<const FIn1Gate&>(g);
         return wdepth[g1.in] + 1;
+      }
+
+      case GateType::kEqz: {
+        // EqZ opens x+r1, then opens the masked Hamming distance in the
+        // domain {0, ..., ring_bits<T>()}.  The result is available after two
+        // reconstruction rounds.
+        const auto& g1 = static_cast<const FIn1Gate&>(g);
+        return wdepth[g1.in] + 2;
       }
 
       case GateType::kShuffle: {

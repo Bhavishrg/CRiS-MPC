@@ -242,6 +242,8 @@ class OnlineEvaluator {
         case GateType::kMul:
           mul_gates.push_back(static_cast<const FIn2Gate*>(gp.get()));
           break;
+        case GateType::kEqz:
+          throw std::runtime_error("3PC OnlineEvaluator: kEqz is not supported");
         case GateType::kShuffle:
           shuffle_gates.push_back(static_cast<const ShuffleGate*>(gp.get()));
           break;

@@ -87,6 +87,27 @@ struct BeaverTripleShare {
 };
 
 /**
+ * Per-kEqz preprocessing material held by one compute party.
+ *
+ * EqZ checks whether an arithmetic sharing x is zero.
+ *
+ *   1. r1 is a normal ring mask used to open m1 = x + r1.
+ *   2. r1_bit_mod_shares are additive shares modulo (ring_bits<T>() + 1) of
+ *      the bit decomposition of r1.  They let parties compute the Hamming
+ *      distance between opened m1 and secret r1 in the small distance domain.
+ *   3. r2_mod_share is an additive share modulo the same small domain.
+ *   4. r2_lookup_share is a normal ring sharing of a one-hot lookup table with
+ *      a 1 at the secret r2 index.
+ */
+template <typename T>
+struct EqzGatePreproc {
+  AdditiveShare<T> r1;
+  std::vector<T> r1_bit_mod_shares;
+  T r2_mod_share{};
+  std::vector<T> r2_lookup_share;
+};
+
+/**
  * Per-shuffle preprocessing material held by one compute party.
  *
  * The local permutation is shared across all shuffle gates with the same
@@ -137,6 +158,7 @@ struct PermShGatePreproc {
 template <typename T>
 struct Preprocessing {
   std::vector<BeaverTripleShare<T>> triples;
+  std::vector<EqzGatePreproc<T>> eqz;
   std::vector<ShuffleGatePreproc<T>> shuffles;
   std::vector<PermShGatePreproc<T>> permsh;
 };

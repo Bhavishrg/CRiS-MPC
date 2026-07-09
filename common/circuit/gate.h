@@ -15,6 +15,7 @@ enum class GateType {
   kCSub,    // local:       out = in  - c   (inv=false) or c - in (inv=true)
   kCMul,    // local:       out = in  * c
   kMul,     // interactive: out = in1 * in2  (RSS multiplication, 1 round)
+  kEqz,     // interactive: out = 1 iff in == 0, else 0
   kRec,     // interactive: reconstruct — all parties learn the plaintext
   kRecP,    // interactive: reconstruct to `target` party only
   kShuffle,    // interactive: secretly apply grouped/random shuffle permutation

@@ -81,7 +81,7 @@ class OnlineEvaluator {
   }
 
   /// Evaluate one communication level. The first call initialises the wire
-  /// table. Callers should invoke levels sequentially from 0 upward; the
+  /// table. Callers should invoke levels sequentially from 0 onward; the
   /// ProtocolRunner enforces this when this evaluator is used through the
   /// protocol abstraction.
   void evalLevel(size_t idx, const LevelOrderedCircuit& lc) {
@@ -102,6 +102,7 @@ class OnlineEvaluator {
     std::vector<std::vector<const FIn1Gate*>> recp_by_target(
         static_cast<size_t>(num_compute_parties_));
     std::vector<const FIn2Gate*> mul_gates;
+    std::vector<const FIn1Gate*> eqz_gates;
 
     // Keep permutation gates in consecutive same-kind runs.
     // Preprocessing is consumed in this exact order, while still allowing
@@ -132,6 +133,9 @@ class OnlineEvaluator {
         case GateType::kMul:
           mul_gates.push_back(static_cast<const FIn2Gate*>(gp.get()));
           break;
+        case GateType::kEqz:
+          eqz_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
+          break;
         case GateType::kShuffle:
         case GateType::kUnshuffle:
         case GateType::kPermSh:
@@ -146,6 +150,7 @@ class OnlineEvaluator {
     batchRec(rec_gates);
     batchRecP(recp_by_target);
     batchMul(mul_gates);
+    batchEqz(eqz_gates);
 
     for (const auto& run : permutation_runs) {
       if (run.first == GateType::kShuffle) {
@@ -204,6 +209,7 @@ class OnlineEvaluator {
   std::vector<AdditiveShare<T>> wires_;
   std::unordered_map<wire_t, T> inputs_;
   size_t triple_pos_{0};
+  size_t eqz_pos_{0};
   size_t shuffle_pos_{0};
   size_t permsh_pos_{0};
   bool evaluation_initialized_{false};
@@ -218,6 +224,7 @@ class OnlineEvaluator {
     validateSupported(lc);
     wires_.assign(lc.num_wires, AdditiveShare<T>{});
     triple_pos_ = 0;
+    eqz_pos_ = 0;
     shuffle_pos_ = 0;
     permsh_pos_ = 0;
     evaluation_initialized_ = true;
@@ -226,6 +233,9 @@ class OnlineEvaluator {
   void checkAllPreprocessingConsumed() const {
     if (triple_pos_ != preproc_.triples.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused Beaver triples after evaluation");
+    }
+    if (eqz_pos_ != preproc_.eqz.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: unused kEqz preprocessing after evaluation");
     }
     if (shuffle_pos_ != preproc_.shuffles.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused shuffle preprocessing after evaluation");
@@ -242,6 +252,18 @@ class OnlineEvaluator {
                                std::to_string(w));
     }
     return it->second;
+  }
+
+  static constexpr size_t eqzDomainSize() {
+    return RingTraits<T>::bit_width + 1;
+  }
+
+  static size_t modDomainIndex(T value, size_t domain) {
+    return static_cast<size_t>(value % static_cast<T>(domain));
+  }
+
+  static T bitAt(T value, size_t bit) {
+    return static_cast<T>((value >> bit) & T{1});
   }
 
   void validateSupported(const LevelOrderedCircuit& lc) const {
@@ -263,6 +285,7 @@ class OnlineEvaluator {
           case GateType::kCSub:
           case GateType::kCMul:
           case GateType::kMul:
+          case GateType::kEqz:
           case GateType::kRec:
           case GateType::kShuffle:
             break;
@@ -476,6 +499,75 @@ class OnlineEvaluator {
       net_.flush();
     } else {
       net_.send_ring<T>(my_shares.data(), n, 0);
+      net_.flush(0);
+      net_.recv_ring<T>(result.data(), n, 0);
+    }
+
+    return result;
+  }
+
+  std::vector<T> reconstructMod(const std::vector<T>& my_shares,
+                                size_t modulus,
+                                bool pking = false) {
+    if (modulus == 0) {
+      throw std::invalid_argument("NPH OnlineEvaluator::reconstructMod: zero modulus");
+    }
+
+    const size_t n = my_shares.size();
+    std::vector<T> reduced(n, T{});
+    std::vector<T> result(n, T{});
+    if (n == 0) return result;
+
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      reduced[i] = static_cast<T>(modDomainIndex(my_shares[i], modulus));
+    }
+
+    auto add_mod_into = [&](std::vector<T>& dst, const std::vector<T>& src) {
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+        const size_t i = static_cast<size_t>(ii);
+        const size_t sum =
+            (modDomainIndex(dst[i], modulus) + modDomainIndex(src[i], modulus)) %
+            modulus;
+        dst[i] = static_cast<T>(sum);
+      }
+    };
+
+    if (!pking) {
+      result = reduced;
+
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p == pid_) continue;
+        net_.send_ring<T>(reduced.data(), n, p);
+      }
+      net_.flush();
+
+      std::vector<T> buf(n);
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p == pid_) continue;
+        net_.recv_ring<T>(buf.data(), n, p);
+        add_mod_into(result, buf);
+      }
+
+      return result;
+    }
+
+    if (pid_ == 0) {
+      result = reduced;
+
+      std::vector<T> buf(n);
+      for (int p = 1; p < num_compute_parties_; ++p) {
+        net_.recv_ring<T>(buf.data(), n, p);
+        add_mod_into(result, buf);
+      }
+
+      for (int p = 1; p < num_compute_parties_; ++p)
+        net_.send_ring<T>(result.data(), n, p);
+      net_.flush();
+    } else {
+      net_.send_ring<T>(reduced.data(), n, 0);
       net_.flush(0);
       net_.recv_ring<T>(result.data(), n, 0);
     }
@@ -855,6 +947,71 @@ class OnlineEvaluator {
     }
 
     permsh_pos_ += G;
+  }
+
+  void batchEqz(const std::vector<const FIn1Gate*>& gates) {
+    if (gates.empty()) return;
+
+    const size_t n = gates.size();
+    const size_t bits = RingTraits<T>::bit_width;
+    const size_t domain = eqzDomainSize();
+
+    if (eqz_pos_ + n > preproc_.eqz.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: not enough kEqz preprocessing");
+    }
+
+    std::vector<const EqzGatePreproc<T>*> pps(n, nullptr);
+    for (size_t i = 0; i < n; ++i) {
+      const EqzGatePreproc<T>& pp = preproc_.eqz[eqz_pos_ + i];
+      if (pp.r1_bit_mod_shares.size() != bits ||
+          pp.r2_lookup_share.size() != domain) {
+        throw std::runtime_error("NPH batchEqz: preprocessing mismatch");
+      }
+      pps[i] = &pp;
+    }
+
+    std::vector<T> masked_input(n);
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      masked_input[i] = wires_[gates[i]->in].value + pps[i]->r1.value;
+    }
+
+    const std::vector<T> opened_m1 = reconstruct(masked_input, pking_);
+
+    std::vector<T> distance_mask_shares(n, T{});
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const EqzGatePreproc<T>& pp = *pps[i];
+
+      size_t acc = modDomainIndex(pp.r2_mod_share, domain);
+      for (size_t bit = 0; bit < bits; ++bit) {
+        const size_t r_bit_share =
+            modDomainIndex(pp.r1_bit_mod_shares[bit], domain);
+        size_t term = r_bit_share;
+        if (bitAt(opened_m1[i], bit) != T{0}) {
+          const size_t public_one = (pid_ == 0) ? 1 : 0;
+          term = (public_one + domain - r_bit_share) % domain;
+        }
+        acc = (acc + term) % domain;
+      }
+
+      distance_mask_shares[i] = static_cast<T>(acc);
+    }
+
+    const std::vector<T> opened_m2 =
+        reconstructMod(distance_mask_shares, domain, pking_);
+
+    #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const size_t lookup_idx = modDomainIndex(opened_m2[i], domain);
+      wires_[gates[i]->out] =
+          AdditiveShare<T>(pps[i]->r2_lookup_share[lookup_idx]);
+    }
+
+    eqz_pos_ += n;
   }
 
   void batchMul(const std::vector<const FIn2Gate*>& gates) {
