@@ -3,8 +3,8 @@
 #include "common/circuit/circuit.h"
 #include "nph/arith/offline_evaluator.h"
 #include "nph/net/net_np.h"
+#include "nph/utils/preproc.h"
 #include "nph/utils/prg_np.h"
-#include "nph/utils/share.h"
 
 #include <algorithm>
 #include <cstddef>
