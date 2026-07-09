@@ -19,6 +19,7 @@
 //   ./run.sh bench_unshuffle --protocol rss3 --vec-size 1000
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000
 //   ./run.sh bench_unshuffle --protocol nph --num-parties 5 --vec-size 1000 --pking
+//   ./run.sh bench_unshuffle --protocol nph --num-parties 2 --vec-size 1000 --disable-optimized-shuffle
 
 #include "common/circuit/circuit.h"
 #include "benchmark/utils.h"
@@ -93,6 +94,7 @@ struct Args {
     protocol::ProtocolKind protocol = protocol::ProtocolKind::Rss3;
     int num_parties = 3;  // compute parties; nph has one extra helper process
     bool pking = false;   // nph only: reconstruct through P0 in two rounds
+    bool disable_optimized_shuffle = false;  // nph only
 
     size_t vec_size = 0;
 
@@ -107,11 +109,12 @@ static void printUsage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
         "--vec-size <N> [--pking] [--port <p>] [--peer <addr>] "
-        "[--repeat <r>] [--output <file>]\n\n"
+        "[--repeat <r>] [--output <file>] [--disable-optimized-shuffle]\n\n"
         "Protocols:\n"
         "  rss3: --num-parties must be 3, pids 0..2\n"
         "  nph : --num-parties is the number of compute parties, helper pid is n\n"
-        "        --pking enables two-round reconstruction through P0\n",
+        "        --pking enables two-round reconstruction through P0\n"
+        "        --disable-optimized-shuffle forces generic shuffle/unshuffle\n",
         prog);
 }
 
@@ -132,6 +135,8 @@ static Args parseArgs(int argc, char* argv[]) {
             a.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--pking") == 0) {
             a.pking = true;
+        } else if (std::strcmp(argv[i], "--disable-optimized-shuffle") == 0) {
+            a.disable_optimized_shuffle = true;
         } else if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             a.peer = argv[++i];
         } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
@@ -195,6 +200,8 @@ static void benchmark(const Args& args) {
                     ? " compute parties + 1 helper"
                     : "");
     std::printf("  pking       : %s\n", args.pking ? "true" : "false");
+    std::printf("  opt_shuffle : %s\n",
+                args.disable_optimized_shuffle ? "disabled" : "enabled");
     std::printf("  pid         : %d%s\n",
                 pid,
                 (args.protocol == protocol::ProtocolKind::Nph && pid == args.num_parties)
@@ -227,6 +234,7 @@ static void benchmark(const Args& args) {
     pcfg.port = args.port;
     pcfg.peer = args.peer;
     pcfg.pking = args.pking;
+    pcfg.disable_optimized_shuffle = args.disable_optimized_shuffle;
 
     std::printf("\n[P%d] Connecting...\n", pid);
     auto runner = protocol::makeProtocolRunner<T>(pcfg);
@@ -245,6 +253,7 @@ static void benchmark(const Args& args) {
         {"protocol", protocol::protocolName(args.protocol)},
         {"num_compute_parties", args.num_parties},
         {"pking", args.pking},
+        {"optimized_shuffle_disabled", args.disable_optimized_shuffle},
         {"pid", pid},
         {"is_helper", runner->isHelper()},
         {"vec_size", n},

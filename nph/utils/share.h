@@ -135,6 +135,14 @@ struct ShuffleGatePreproc {
   std::vector<T> opening_mask_share;  // r_i: masks X before reconstruction to P0
   std::vector<T> chain_mask;          // b_i: masks after this party applies pi_i
   std::vector<T> delta_share;         // delta_i: correction share removed at output
+
+  // Two-compute-party optimized shuffle/unshuffle material.  For grouped gates,
+  // two_party_final_perm is reused across the group so payload alignment and
+  // unshuffle inversion use the same hidden effective permutation.
+  bool two_party_optimized{false};
+  std::vector<size_t> two_party_aux_perm;
+  std::vector<size_t> two_party_final_perm;
+  std::vector<T> two_party_output_mask;
 };
 
 /**

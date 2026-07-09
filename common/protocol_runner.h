@@ -55,6 +55,10 @@ struct ProtocolConfig {
   // uses two communication rounds: parties send shares to P0, then P0 sends the
   // reconstructed plaintexts to all parties.  rss3 ignores this flag.
   bool pking{false};
+
+  // NPH only: force generic shuffle/unshuffle even when the optimized
+  // two-compute-party protocol would otherwise be selected.
+  bool disable_optimized_shuffle{false};
 };
 
 namespace detail {
@@ -236,11 +240,13 @@ class NphProtocolRunner final : public IProtocolRunner<T> {
                     int num_compute_parties,
                     const std::string& peer,
                     int port,
-                    bool pking = false)
+                    bool pking = false,
+                    bool disable_optimized_shuffle = false)
       : pid_(pid),
         num_compute_parties_(num_compute_parties),
         net_(pid, num_compute_parties + 1, peer, port),
-        pking_(pking) {
+        pking_(pking),
+        disable_optimized_shuffle_(disable_optimized_shuffle) {
     if (num_compute_parties_ < 2)
       throw std::invalid_argument("NphProtocolRunner: num_compute_parties must be >= 2");
     if (pid_ < 0 || pid_ > helper_pid())
@@ -274,7 +280,8 @@ class NphProtocolRunner final : public IProtocolRunner<T> {
   }
 
   void offline(const LevelOrderedCircuit& lc) override {
-    nph::OfflineEvaluator<T> offline(pid_, num_compute_parties_, net_);
+    nph::OfflineEvaluator<T> offline(
+        pid_, num_compute_parties_, net_, disable_optimized_shuffle_);
     offline.run(lc);
     preproc_ = offline.take_preprocessing();
     pairwise_prg_ = offline.take_pairwise_prg();
@@ -318,7 +325,8 @@ class NphProtocolRunner final : public IProtocolRunner<T> {
         net_,
         std::move(preproc_),
         std::move(pairwise_prg_),
-        pking_);
+        pking_,
+        disable_optimized_shuffle_);
     for (size_t i = 0; i < input_wires_.size(); ++i)
       online_->setInputs(input_wires_[i], input_values_[i]);
   }
@@ -328,6 +336,7 @@ class NphProtocolRunner final : public IProtocolRunner<T> {
   int pid_;
   int num_compute_parties_;
   bool pking_{false};
+  bool disable_optimized_shuffle_{false};
   nph::NetNP net_;
   nph::Preprocessing<T> preproc_;
   nph::PairwisePRG pairwise_prg_;
@@ -348,7 +357,12 @@ std::unique_ptr<IProtocolRunner<T>> makeProtocolRunner(const ProtocolConfig& cfg
 
     case ProtocolKind::Nph:
       return std::make_unique<NphProtocolRunner<T>>(
-          cfg.pid, cfg.num_compute_parties, cfg.peer, cfg.port, cfg.pking);
+          cfg.pid,
+          cfg.num_compute_parties,
+          cfg.peer,
+          cfg.port,
+          cfg.pking,
+          cfg.disable_optimized_shuffle);
   }
 
   throw std::invalid_argument("Unsupported protocol kind");

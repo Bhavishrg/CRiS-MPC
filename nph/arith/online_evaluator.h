@@ -45,13 +45,15 @@ class OnlineEvaluator {
                   NetNP& net,
                   Preprocessing<T> preproc,
                   PairwisePRG pairwise_prg,
-                  bool pking = false)
+                  bool pking = false,
+                  bool disable_optimized_shuffle = false)
       : pid_(pid),
         num_compute_parties_(num_compute_parties),
         net_(net),
         preproc_(std::move(preproc)),
         pairwise_prg_(std::move(pairwise_prg)),
-        pking_(pking) {
+        pking_(pking),
+        disable_optimized_shuffle_(disable_optimized_shuffle) {
     if (num_compute_parties_ < 2)
       throw std::invalid_argument("NPH OnlineEvaluator: need at least two compute parties");
     if (pid_ < 0 || pid_ > helper_pid())
@@ -206,6 +208,7 @@ class OnlineEvaluator {
   Preprocessing<T> preproc_;
   PairwisePRG pairwise_prg_;
   bool pking_{false};
+  bool disable_optimized_shuffle_{false};
   std::vector<AdditiveShare<T>> wires_;
   std::unordered_map<wire_t, T> inputs_;
   size_t triple_pos_{0};
@@ -695,6 +698,17 @@ class OnlineEvaluator {
       total_elems += n;
     }
 
+    bool all_two_party_optimized =
+        (num_compute_parties_ == 2 && !disable_optimized_shuffle_);
+    for (const auto* pp : pps) {
+      all_two_party_optimized = all_two_party_optimized && pp->two_party_optimized;
+    }
+    if (all_two_party_optimized) {
+      batchShuffleTwoPartyOptimized(gates, pps, total_elems);
+      shuffle_pos_ += G;
+      return;
+    }
+
     // Step 1. Mask input shares and reconstruct X + R to P0, which owns the
     // first local permutation in the forward shuffle chain.
     std::vector<T> masked(total_elems, T{});
@@ -756,6 +770,96 @@ class OnlineEvaluator {
     shuffle_pos_ += G;
   }
 
+  void batchShuffleTwoPartyOptimized(
+      const std::vector<const ShuffleGate*>& gates,
+      const std::vector<const ShuffleGatePreproc<T>*>& pps,
+      size_t total_elems) {
+    if (pid_ < 0 || pid_ >= 2 || num_compute_parties_ != 2) {
+      throw std::runtime_error("NPH two-party shuffle: invalid party configuration");
+    }
+
+    std::vector<T> send_buf(total_elems, T{});
+    size_t offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+
+      if (!pp.two_party_optimized ||
+          pp.two_party_aux_perm.size() != n ||
+          pp.two_party_final_perm.size() != n ||
+          pp.two_party_output_mask.size() != n) {
+        throw std::runtime_error("NPH two-party shuffle: preprocessing mismatch");
+      }
+
+      std::vector<T> masked(n);
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      }
+
+      std::vector<T> outgoing;
+      if (pid_ == 0) {
+        // A1 = pi0'(T0 + R0)
+        outgoing = applyPerm(pp.two_party_aux_perm, masked);
+      } else {
+        // A0 = pi1(T1 + R1)
+        outgoing = applyPerm(*pp.local_perm, masked);
+      }
+
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        send_buf[base + j] = outgoing[j];
+      }
+      offset += n;
+    }
+
+    const int peer = 1 - pid_;
+    std::vector<T> recv_buf(total_elems, T{});
+    net_.send_ring<T>(send_buf.data(), send_buf.size(), peer);
+    net_.flush(peer);
+    net_.recv_ring<T>(recv_buf.data(), recv_buf.size(), peer);
+
+    offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const ShuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.outs.size();
+
+      std::vector<T> incoming(
+          recv_buf.begin() + static_cast<std::ptrdiff_t>(offset),
+          recv_buf.begin() + static_cast<std::ptrdiff_t>(offset + n));
+
+      std::vector<T> local_share;
+      if (pid_ == 0) {
+        // P0 receives A0 and computes pi0(A0) - B0.
+        local_share = applyPerm(*pp.local_perm, incoming);
+      } else {
+        // P1 receives A1 and computes pi1'(A1) - B1.
+        local_share = applyPerm(pp.two_party_aux_perm, incoming);
+      }
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        local_share[j] -= pp.two_party_output_mask[j];
+      }
+
+      local_share = applyPerm(pp.two_party_final_perm, local_share);
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        wires_[g.outs[j]] = AdditiveShare<T>(local_share[j]);
+      }
+
+      offset += n;
+    }
+  }
+
   void batchUnshuffle(const std::vector<const UnshuffleGate*>& gates) {
     if (gates.empty()) return;
 
@@ -789,6 +893,17 @@ class OnlineEvaluator {
 
       pps[gi] = &pp;
       total_elems += n;
+    }
+
+    bool all_two_party_optimized =
+        (num_compute_parties_ == 2 && !disable_optimized_shuffle_);
+    for (const auto* pp : pps) {
+      all_two_party_optimized = all_two_party_optimized && pp->two_party_optimized;
+    }
+    if (all_two_party_optimized) {
+      batchUnshuffleTwoPartyOptimized(gates, pps, total_elems);
+      shuffle_pos_ += G;
+      return;
     }
 
     const int last = num_compute_parties_ - 1;
@@ -850,6 +965,104 @@ class OnlineEvaluator {
     }
 
     shuffle_pos_ += G;
+  }
+
+  void batchUnshuffleTwoPartyOptimized(
+      const std::vector<const UnshuffleGate*>& gates,
+      const std::vector<const ShuffleGatePreproc<T>*>& pps,
+      size_t total_elems) {
+    if (pid_ < 0 || pid_ >= 2 || num_compute_parties_ != 2) {
+      throw std::runtime_error("NPH two-party unshuffle: invalid party configuration");
+    }
+
+    std::vector<T> send_buf(total_elems, T{});
+    size_t offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+
+      if (!pp.two_party_optimized ||
+          pp.two_party_aux_perm.size() != n ||
+          pp.two_party_final_perm.size() != n ||
+          pp.two_party_output_mask.size() != n) {
+        throw std::runtime_error("NPH two-party unshuffle: preprocessing mismatch");
+      }
+
+      std::vector<T> masked(n);
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[j] = wires_[g.ins[j]].value;
+      }
+
+      // A grouped optimized shuffle outputs pi2(base_pi(X)).  Invert the
+      // group-scoped pi2 locally before running the optimized base inverse.
+      masked = applyInversePerm(pp.two_party_final_perm, masked);
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[j] += pp.opening_mask_share[j];
+      }
+
+      std::vector<T> outgoing;
+      if (pid_ == 0) {
+        // A1 = pi0^{-1}(T0 + R0)
+        outgoing = applyInversePerm(*pp.local_perm, masked);
+      } else {
+        // A0 = pi1'(T1 + R1), where pi0' o pi1' = base_pi^{-1}.
+        outgoing = applyPerm(pp.two_party_aux_perm, masked);
+      }
+
+      const size_t base = offset;
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        send_buf[base + j] = outgoing[j];
+      }
+      offset += n;
+    }
+
+    const int peer = 1 - pid_;
+    std::vector<T> recv_buf(total_elems, T{});
+    net_.send_ring<T>(send_buf.data(), send_buf.size(), peer);
+    net_.flush(peer);
+    net_.recv_ring<T>(recv_buf.data(), recv_buf.size(), peer);
+
+    offset = 0;
+    for (size_t gi = 0; gi < gates.size(); ++gi) {
+      const UnshuffleGate& g = *gates[gi];
+      const ShuffleGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.outs.size();
+
+      std::vector<T> incoming(
+          recv_buf.begin() + static_cast<std::ptrdiff_t>(offset),
+          recv_buf.begin() + static_cast<std::ptrdiff_t>(offset + n));
+
+      std::vector<T> local_share;
+      if (pid_ == 0) {
+        // P0 receives A0 and computes pi0'(A0) - B0.
+        local_share = applyPerm(pp.two_party_aux_perm, incoming);
+      } else {
+        // P1 receives A1 and computes pi1^{-1}(A1) - B1.
+        local_share = applyInversePerm(*pp.local_perm, incoming);
+      }
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        local_share[j] -= pp.two_party_output_mask[j];
+      }
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        wires_[g.outs[j]] = AdditiveShare<T>(local_share[j]);
+      }
+
+      offset += n;
+    }
   }
 
   void applyShuffleStep(const std::vector<const ShuffleGate*>& gates,

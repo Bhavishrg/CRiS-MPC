@@ -7,3 +7,9 @@ target_link_libraries(test_shuffle3p PRIVATE emp-tool::emp-tool)
 
 add_executable(test_eqz_nph test_eqz_nph.cpp)
 target_link_libraries(test_eqz_nph PRIVATE emp-tool::emp-tool)
+
+add_executable(test_shuffle_nph_2p test_shuffle_nph_2p.cpp)
+target_link_libraries(test_shuffle_nph_2p PRIVATE emp-tool::emp-tool)
+
+add_executable(test_shuffle_nph_2p_grouped test_shuffle_nph_2p_grouped.cpp)
+target_link_libraries(test_shuffle_nph_2p_grouped PRIVATE emp-tool::emp-tool)
