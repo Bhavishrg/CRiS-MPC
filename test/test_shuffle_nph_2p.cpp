@@ -76,6 +76,17 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "[P%d] shuffle preprocessing did not use optimized path\n", pid);
         return 1;
       }
+      if (!pp.chain_mask.empty() || !pp.delta_share.empty()) {
+        std::fprintf(stderr, "[P%d] optimized shuffle kept generic preprocessing\n", pid);
+        return 1;
+      }
+      if (pp.two_party_send_src_idx.size() != pp.vec_size ||
+          pp.two_party_send_mask_idx.size() != pp.vec_size ||
+          pp.two_party_recv_src_idx.size() != pp.vec_size ||
+          pp.two_party_recv_mask_idx.size() != pp.vec_size) {
+        std::fprintf(stderr, "[P%d] optimized shuffle missing online maps\n", pid);
+        return 1;
+      }
     }
   }
 

@@ -120,6 +120,23 @@ int main(int argc, char* argv[]) {
                      pid, i);
         return 1;
       }
+      if (!pp.chain_mask.empty() || !pp.delta_share.empty()) {
+        std::fprintf(stderr,
+                     "[P%d] grouped optimized preprocessing kept generic data at %zu\n",
+                     pid,
+                     i);
+        return 1;
+      }
+      if (pp.two_party_send_src_idx.size() != pp.vec_size ||
+          pp.two_party_send_mask_idx.size() != pp.vec_size ||
+          pp.two_party_recv_src_idx.size() != pp.vec_size ||
+          pp.two_party_recv_mask_idx.size() != pp.vec_size) {
+        std::fprintf(stderr,
+                     "[P%d] grouped optimized preprocessing missing online maps at %zu\n",
+                     pid,
+                     i);
+        return 1;
+      }
     }
   }
 

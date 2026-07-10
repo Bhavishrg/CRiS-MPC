@@ -6,6 +6,7 @@
 #include "src/nph/utils/prg_np.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -105,6 +106,12 @@ class OfflineEvaluator {
 
  private:
   struct ShufflePermGroup {
+    struct TwoPartyOptimizedMaterial {
+      std::vector<size_t> target_pi;
+      std::vector<size_t> p0_aux;
+      std::vector<size_t> p1_aux;
+    };
+
     size_t vec_size{0};
 
     // Used by the helper: all_perms[p] is the permutation pi_p of party P_p.
@@ -117,6 +124,16 @@ class OfflineEvaluator {
     // Used only by compute parties in the two-party optimized path.  Grouped
     // shuffle/unshuffle gates reuse this final permutation across the group.
     std::shared_ptr<const std::vector<size_t>> two_party_final_perm;
+
+    // Used by the helper to reuse optimized split permutations across grouped
+    // payload columns.  Forward and inverse need distinct target permutations.
+    std::unique_ptr<TwoPartyOptimizedMaterial> two_party_forward;
+    std::unique_ptr<TwoPartyOptimizedMaterial> two_party_inverse;
+
+    // Used by P0 to keep PRG consumption aligned with the helper when grouped
+    // optimized gates reuse the same auxiliary split permutation.
+    std::shared_ptr<const std::vector<size_t>> two_party_aux_forward;
+    std::shared_ptr<const std::vector<size_t>> two_party_aux_inverse;
   };
 
   struct PermShPermGroup {
@@ -195,17 +212,67 @@ class OfflineEvaluator {
   }
 
   static std::vector<size_t> invertPerm(const std::vector<size_t>& perm) {
-    std::vector<size_t> inv(perm.size());
-    std::vector<bool> seen(perm.size(), false);
-    for (size_t i = 0; i < perm.size(); ++i) {
-      if (perm[i] >= perm.size()) {
-        throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
+    const size_t n = perm.size();
+    std::vector<size_t> inv(n);
+
+    if (n < kParallelPermThreshold) {
+      std::vector<bool> seen(n, false);
+      for (size_t i = 0; i < n; ++i) {
+        if (perm[i] >= n) {
+          throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
+        }
+        if (seen[perm[i]]) {
+          throw std::runtime_error("NPH shuffle preprocessing: duplicate permutation index");
+        }
+        seen[perm[i]] = true;
+        inv[perm[i]] = i;
       }
-      if (seen[perm[i]]) {
-        throw std::runtime_error("NPH shuffle preprocessing: duplicate permutation index");
+      return inv;
+    }
+
+    int range_ok = 1;
+    #pragma omp parallel for if(n >= kParallelPermThreshold) schedule(static) reduction(&:range_ok)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      if (perm[i] >= n) range_ok = 0;
+    }
+    if (!range_ok) {
+      throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
+    }
+
+    std::vector<std::atomic<size_t>> atomic_inv(n);
+    #pragma omp parallel for if(n >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      atomic_inv[static_cast<size_t>(ii)].store(n, std::memory_order_relaxed);
+    }
+
+    int unique_ok = 1;
+    #pragma omp parallel for if(n >= kParallelPermThreshold) schedule(static) reduction(&:unique_ok)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      size_t expected = n;
+      if (!atomic_inv[perm[i]].compare_exchange_strong(
+              expected, i, std::memory_order_relaxed)) {
+        unique_ok = 0;
       }
-      seen[perm[i]] = true;
-      inv[perm[i]] = i;
+    }
+    if (!unique_ok) {
+      throw std::runtime_error("NPH shuffle preprocessing: duplicate permutation index");
+    }
+
+    int complete_ok = 1;
+    #pragma omp parallel for if(n >= kParallelPermThreshold) schedule(static) reduction(&:complete_ok)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const size_t value = atomic_inv[i].load(std::memory_order_relaxed);
+      if (value >= n) {
+        complete_ok = 0;
+      } else {
+        inv[i] = value;
+      }
+    }
+    if (!complete_ok) {
+      throw std::runtime_error("NPH shuffle preprocessing: duplicate permutation index");
     }
     return inv;
   }
@@ -219,11 +286,18 @@ class OfflineEvaluator {
     // Pull convention: applyPerm(p, v)[i] = v[p[i]].
     // Applying inner then outer yields v[inner[outer[i]]].
     std::vector<size_t> composed(outer.size());
-    for (size_t i = 0; i < outer.size(); ++i) {
+    int ok = 1;
+    #pragma omp parallel for if(outer.size() >= kParallelPermThreshold) schedule(static) reduction(&:ok)
+    for (long long ii = 0; ii < static_cast<long long>(outer.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       if (outer[i] >= inner.size()) {
-        throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
+        ok = 0;
+      } else {
+        composed[i] = inner[outer[i]];
       }
-      composed[i] = inner[outer[i]];
+    }
+    if (!ok) {
+      throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
     }
     return composed;
   }
@@ -240,11 +314,18 @@ class OfflineEvaluator {
     // Under pull convention this means left_perm[right_perm[i]] = target[i].
     const std::vector<size_t> inv_left = invertPerm(left_perm);
     std::vector<size_t> right_perm(target.size());
-    for (size_t i = 0; i < target.size(); ++i) {
+    int ok = 1;
+    #pragma omp parallel for if(target.size() >= kParallelPermThreshold) schedule(static) reduction(&:ok)
+    for (long long ii = 0; ii < static_cast<long long>(target.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       if (target[i] >= inv_left.size()) {
-        throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
+        ok = 0;
+      } else {
+        right_perm[i] = inv_left[target[i]];
       }
-      right_perm[i] = inv_left[target[i]];
+    }
+    if (!ok) {
+      throw std::runtime_error("NPH shuffle preprocessing: permutation index out of range");
     }
     return right_perm;
   }
@@ -261,7 +342,9 @@ class OfflineEvaluator {
     // Under pull convention this means left_perm[right_perm[i]] = target[i].
     const std::vector<size_t> inv_right = invertPerm(right_perm);
     std::vector<size_t> left_perm(target.size());
-    for (size_t i = 0; i < target.size(); ++i) {
+    #pragma omp parallel for if(target.size() >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(target.size()); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
       left_perm[i] = target[inv_right[i]];
     }
     return left_perm;
@@ -626,23 +709,30 @@ class OfflineEvaluator {
     return inserted.first->second;
   }
 
+  ShufflePermGroup& shufflePermGroupForGate(
+      const Gate& gate,
+      std::unordered_map<int, ShufflePermGroup>& cache,
+      ShufflePermGroup& fresh_group) {
+    const size_t n = permGateIns(gate).size();
+
+    if (permGateGroupId(gate) >= 0) {
+      return getOrCreateShufflePermGroup(permGateGroupId(gate), n, cache);
+    }
+
+    // Ungrouped shuffle: fresh independent permutations/material for this
+    // gate.  Store them in fresh_group so repeated calls in this same gate
+    // reuse the same fresh material.
+    if (fresh_group.vec_size == 0) fresh_group = makeFreshShufflePermGroup(n);
+    return fresh_group;
+  }
+
   const std::vector<size_t>& permutationForParty(
       const Gate& gate,
       int party,
       std::unordered_map<int, ShufflePermGroup>& cache,
       ShufflePermGroup& fresh_group) {
-    const size_t n = permGateIns(gate).size();
-
-    ShufflePermGroup* group = nullptr;
-    if (permGateGroupId(gate) >= 0) {
-      group = &getOrCreateShufflePermGroup(permGateGroupId(gate), n, cache);
-    } else {
-      // Ungrouped shuffle: fresh independent permutations for this gate.
-      // Store them in fresh_group so repeated calls for different parties in
-      // this same gate reuse the same fresh material.
-      if (fresh_group.vec_size == 0) fresh_group = makeFreshShufflePermGroup(n);
-      group = &fresh_group;
-    }
+    ShufflePermGroup& group =
+        shufflePermGroupForGate(gate, cache, fresh_group);
 
     if (!is_helper()) {
       throw std::logic_error(
@@ -651,35 +741,27 @@ class OfflineEvaluator {
     if (party < 0 || party >= num_compute_parties_) {
       throw std::runtime_error("NPH shuffle preprocessing: invalid party id");
     }
-    if (group->all_perms.size() != static_cast<size_t>(num_compute_parties_)) {
+    if (group.all_perms.size() != static_cast<size_t>(num_compute_parties_)) {
       throw std::runtime_error("NPH shuffle preprocessing: missing helper permutations");
     }
-    return group->all_perms[static_cast<size_t>(party)];
+    return group.all_perms[static_cast<size_t>(party)];
   }
 
   std::shared_ptr<const std::vector<size_t>> localPermutationForGate(
       const Gate& gate,
       std::unordered_map<int, ShufflePermGroup>& cache,
       ShufflePermGroup& fresh_group) {
-    const size_t n = permGateIns(gate).size();
-
-    ShufflePermGroup* group = nullptr;
-    if (permGateGroupId(gate) >= 0) {
-      group = &getOrCreateShufflePermGroup(permGateGroupId(gate), n, cache);
-    } else {
-      // Ungrouped shuffle: fresh independent local permutation for this gate.
-      if (fresh_group.vec_size == 0) fresh_group = makeFreshShufflePermGroup(n);
-      group = &fresh_group;
-    }
+    ShufflePermGroup& group =
+        shufflePermGroupForGate(gate, cache, fresh_group);
 
     if (is_helper()) {
       throw std::logic_error(
           "NPH shuffle preprocessing: localPermutationForGate is compute-only");
     }
-    if (!group->local_perm) {
+    if (!group.local_perm) {
       throw std::runtime_error("NPH shuffle preprocessing: missing local permutation");
     }
-    return group->local_perm;
+    return group.local_perm;
   }
 
   std::shared_ptr<const std::vector<size_t>> twoPartyFinalPermutationForGate(
@@ -687,14 +769,8 @@ class OfflineEvaluator {
       std::unordered_map<int, ShufflePermGroup>& cache,
       ShufflePermGroup& fresh_group) {
     const size_t n = permGateIns(gate).size();
-
-    ShufflePermGroup* group = nullptr;
-    if (permGateGroupId(gate) >= 0) {
-      group = &getOrCreateShufflePermGroup(permGateGroupId(gate), n, cache);
-    } else {
-      if (fresh_group.vec_size == 0) fresh_group = makeFreshShufflePermGroup(n);
-      group = &fresh_group;
-    }
+    ShufflePermGroup& group =
+        shufflePermGroupForGate(gate, cache, fresh_group);
 
     if (is_helper()) {
       throw std::logic_error(
@@ -705,12 +781,150 @@ class OfflineEvaluator {
           "NPH shuffle preprocessing: optimized final permutation requires two parties");
     }
 
-    if (!group->two_party_final_perm) {
+    if (!group.two_party_final_perm) {
       const int peer = 1 - pid_;
-      group->two_party_final_perm = std::make_shared<std::vector<size_t>>(
+      group.two_party_final_perm = std::make_shared<std::vector<size_t>>(
           samplePermutationWithParty(peer, n));
     }
-    return group->two_party_final_perm;
+    return group.two_party_final_perm;
+  }
+
+  typename ShufflePermGroup::TwoPartyOptimizedMaterial&
+  helperTwoPartyOptimizedMaterialForGate(
+      const Gate& gate,
+      bool inverse,
+      std::unordered_map<int, ShufflePermGroup>& cache,
+      ShufflePermGroup& fresh_group) {
+    if (!is_helper()) {
+      throw std::logic_error(
+          "NPH shuffle preprocessing: optimized material is helper-only");
+    }
+    if (num_compute_parties_ != 2) {
+      throw std::logic_error(
+          "NPH shuffle preprocessing: optimized material requires two parties");
+    }
+
+    const size_t n = permGateIns(gate).size();
+    ShufflePermGroup& group =
+        shufflePermGroupForGate(gate, cache, fresh_group);
+    std::unique_ptr<typename ShufflePermGroup::TwoPartyOptimizedMaterial>* slot =
+        inverse ? &group.two_party_inverse : &group.two_party_forward;
+
+    if (!*slot) {
+      if (group.all_perms.size() != 2) {
+        throw std::runtime_error(
+            "NPH shuffle preprocessing: missing helper permutations");
+      }
+
+      auto material =
+          std::make_unique<typename ShufflePermGroup::TwoPartyOptimizedMaterial>();
+      const std::vector<size_t> base_pi =
+          composePerm(group.all_perms[0], group.all_perms[1]);
+      material->target_pi = inverse ? invertPerm(base_pi) : base_pi;
+
+      // Forward shuffle: P0 samples the first split permutation and P1 gets
+      // the derived second split.  Unshuffle inverts the base permutation:
+      // P0 samples the second split and P1 gets the derived first split.
+      material->p0_aux = samplePermutationWithParty(0, n);
+      material->p1_aux =
+          inverse ? deriveLeftPerm(material->target_pi, material->p0_aux)
+                  : deriveRightPerm(material->target_pi, material->p0_aux);
+
+      *slot = std::move(material);
+    }
+
+    return **slot;
+  }
+
+  std::shared_ptr<const std::vector<size_t>> twoPartyAuxPermutationForGate(
+      const Gate& gate,
+      bool inverse,
+      std::unordered_map<int, ShufflePermGroup>& cache,
+      ShufflePermGroup& fresh_group) {
+    if (is_helper()) {
+      throw std::logic_error(
+          "NPH shuffle preprocessing: optimized aux permutation is compute-only");
+    }
+    if (pid_ != 0) {
+      throw std::logic_error(
+          "NPH shuffle preprocessing: optimized aux permutation is P0-only");
+    }
+
+    const size_t n = permGateIns(gate).size();
+    ShufflePermGroup& group =
+        shufflePermGroupForGate(gate, cache, fresh_group);
+    std::shared_ptr<const std::vector<size_t>>* slot =
+        inverse ? &group.two_party_aux_inverse : &group.two_party_aux_forward;
+
+    if (!*slot) {
+      *slot = std::make_shared<std::vector<size_t>>(
+          samplePermutationWithParty(helper_pid(), n));
+    }
+    return *slot;
+  }
+
+  void populateTwoPartyOptimizedOnlineMaps(ShuffleGatePreproc<T>& pp) const {
+    if (!pp.two_party_optimized || !pp.local_perm) {
+      throw std::logic_error(
+          "NPH shuffle preprocessing: optimized online map requires optimized preprocessing");
+    }
+
+    const size_t n = pp.vec_size;
+    if (pp.local_perm->size() != n ||
+        pp.two_party_aux_perm.size() != n ||
+        pp.two_party_final_perm.size() != n) {
+      throw std::runtime_error(
+          "NPH shuffle preprocessing: optimized online map size mismatch");
+    }
+
+    pp.two_party_send_src_idx.resize(n);
+    pp.two_party_send_mask_idx.resize(n);
+    pp.two_party_recv_src_idx.resize(n);
+    pp.two_party_recv_mask_idx.resize(n);
+
+    if (!pp.inverse) {
+      const std::vector<size_t>& send_perm =
+          (pid_ == 0) ? pp.two_party_aux_perm : *pp.local_perm;
+      const std::vector<size_t>& recv_perm =
+          (pid_ == 0) ? *pp.local_perm : pp.two_party_aux_perm;
+
+      #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        const size_t final_idx = pp.two_party_final_perm[j];
+        pp.two_party_send_src_idx[j] = send_perm[j];
+        pp.two_party_send_mask_idx[j] = send_perm[j];
+        pp.two_party_recv_src_idx[j] = recv_perm[final_idx];
+        pp.two_party_recv_mask_idx[j] = final_idx;
+      }
+      return;
+    }
+
+    if (pid_ == 0) {
+      #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t input_idx = static_cast<size_t>(jj);
+        const size_t mask_idx = pp.two_party_final_perm[input_idx];
+        const size_t send_idx = (*pp.local_perm)[mask_idx];
+        pp.two_party_send_src_idx[send_idx] = input_idx;
+        pp.two_party_send_mask_idx[send_idx] = mask_idx;
+        pp.two_party_recv_src_idx[input_idx] = pp.two_party_aux_perm[input_idx];
+        pp.two_party_recv_mask_idx[input_idx] = input_idx;
+      }
+    } else {
+      const std::vector<size_t> inv_aux = invertPerm(pp.two_party_aux_perm);
+      const std::vector<size_t> inv_local = invertPerm(*pp.local_perm);
+      #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t input_idx = static_cast<size_t>(jj);
+        const size_t mask_idx = pp.two_party_final_perm[input_idx];
+        const size_t send_idx = inv_aux[mask_idx];
+        pp.two_party_send_src_idx[send_idx] = input_idx;
+        pp.two_party_send_mask_idx[send_idx] = mask_idx;
+        pp.two_party_recv_src_idx[input_idx] = inv_local[input_idx];
+        pp.two_party_recv_mask_idx[input_idx] = input_idx;
+      }
+    }
   }
 
   PermShPermGroup makeFreshPermShPermGroup(size_t n, int target) {
@@ -800,11 +1014,13 @@ class OfflineEvaluator {
     std::vector<size_t> missing_delta_elems(static_cast<size_t>(num_compute_parties_), 0);
     size_t two_party_optimized_elems = 0;
     for (const auto* g : gates) {
-      const bool inverse = isInversePermutationGate(*g);
-      const int final_party = inverse ? 0 : last;
-      missing_delta_elems[static_cast<size_t>(final_party)] += permGateIns(*g).size();
+      const size_t n = permGateIns(*g).size();
       if (isTwoPartyOptimizedPermutationGate(*g)) {
-        two_party_optimized_elems += permGateIns(*g).size();
+        two_party_optimized_elems += n;
+      } else {
+        const bool inverse = isInversePermutationGate(*g);
+        const int final_party = inverse ? 0 : last;
+        missing_delta_elems[static_cast<size_t>(final_party)] += n;
       }
     }
 
@@ -856,6 +1072,7 @@ class OfflineEvaluator {
     for (const Gate* gate_ptr : gates) {
       const Gate& gate = *gate_ptr;
       const bool inverse = isInversePermutationGate(gate);
+      const bool optimized = isTwoPartyOptimizedPermutationGate(gate);
       const int final_party = inverse ? 0 : last;
       const size_t n = permGateIns(gate).size();
       if (n == 0) {
@@ -869,104 +1086,97 @@ class OfflineEvaluator {
       if (is_helper()) {
         std::vector<std::vector<T>> opening_masks(
             static_cast<size_t>(num_compute_parties_));
-        std::vector<std::vector<T>> chain_masks(
-            static_cast<size_t>(num_compute_parties_));
+        std::vector<std::vector<T>> chain_masks;
+        std::vector<T> R;
 
-        std::vector<T> R(n, T{});
+        if (!optimized) {
+          chain_masks.resize(static_cast<size_t>(num_compute_parties_));
+          R.assign(n, T{});
+        }
+
         for (int p = 0; p < num_compute_parties_; ++p) {
           // Generate/reuse pi_p before masks so that the helper and party P_p
           // consume their common PRG stream in the same order.
           (void)permutationForParty(gate, p, perm_cache, fresh_group);
 
           opening_masks[static_cast<size_t>(p)] = sampleVectorWithParty(p, n);
-          chain_masks[static_cast<size_t>(p)] = sampleVectorWithParty(p, n);
-          const auto& opening = opening_masks[static_cast<size_t>(p)];
-          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
-          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
-            const size_t j = static_cast<size_t>(jj);
-            R[j] += opening[j];
+          if (!optimized) {
+            chain_masks[static_cast<size_t>(p)] = sampleVectorWithParty(p, n);
+            const auto& opening = opening_masks[static_cast<size_t>(p)];
+            #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              R[j] += opening[j];
+            }
           }
         }
 
-        // Delta is the result of applying the online permutation/masking chain
-        // to R.  Shuffle runs P0 -> ... -> P_{n-1} with pi_p.  Unshuffle runs
-        // P_{n-1} -> ... -> P0 with pi_p^{-1}.  Online applies the same chain
-        // to X+R, so subtracting Delta leaves pi(X) or pi^{-1}(X).
-        std::vector<T> delta = R;
-        if (!inverse) {
+        if (!optimized) {
+          // Delta is the result of applying the online permutation/masking
+          // chain to R.  Shuffle runs P0 -> ... -> P_{n-1} with pi_p.
+          // Unshuffle runs P_{n-1} -> ... -> P0 with pi_p^{-1}.  Online
+          // applies the same chain to X+R, so subtracting Delta leaves pi(X)
+          // or pi^{-1}(X).
+          std::vector<T> delta = R;
+          if (!inverse) {
+            for (int p = 0; p < num_compute_parties_; ++p) {
+              const std::vector<size_t>& pi =
+                  permutationForParty(gate, p, perm_cache, fresh_group);
+              delta = applyPerm(pi, delta);
+              const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
+              #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+              for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+                const size_t j = static_cast<size_t>(jj);
+                delta[j] += b[j];
+              }
+            }
+          } else {
+            for (int p = num_compute_parties_ - 1; p >= 0; --p) {
+              const std::vector<size_t>& pi =
+                  permutationForParty(gate, p, perm_cache, fresh_group);
+              delta = applyInversePerm(pi, delta);
+              const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
+              #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+              for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+                const size_t j = static_cast<size_t>(jj);
+                delta[j] += b[j];
+              }
+            }
+          }
+
+          // Secret-share Delta.  All shares except the final chain party's
+          // share are PRG-derived.  The helper sends only the missing final
+          // share:
+          //   shuffle:   final party is P_{n-1}
+          //   unshuffle: final party is P0
+          std::vector<T> delta_sum(n, T{});
           for (int p = 0; p < num_compute_parties_; ++p) {
-            const std::vector<size_t>& pi =
-                permutationForParty(gate, p, perm_cache, fresh_group);
-            delta = applyPerm(pi, delta);
-            const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
+            if (p == final_party) continue;
+            const std::vector<T> delta_p = sampleVectorWithParty(p, n);
             #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
             for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
               const size_t j = static_cast<size_t>(jj);
-              delta[j] += b[j];
+              delta_sum[j] += delta_p[j];
             }
           }
-        } else {
-          for (int p = num_compute_parties_ - 1; p >= 0; --p) {
-            const std::vector<size_t>& pi =
-                permutationForParty(gate, p, perm_cache, fresh_group);
-            delta = applyInversePerm(pi, delta);
-            const std::vector<T>& b = chain_masks[static_cast<size_t>(p)];
-            #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
-            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
-              const size_t j = static_cast<size_t>(jj);
-              delta[j] += b[j];
-            }
-          }
-        }
 
-        // Secret-share Delta.  All shares except the final chain party's share
-        // are PRG-derived.  The helper sends only the missing final share:
-        //   shuffle:   final party is P_{n-1}
-        //   unshuffle: final party is P0
-        std::vector<T> delta_sum(n, T{});
-        for (int p = 0; p < num_compute_parties_; ++p) {
-          if (p == final_party) continue;
-          const std::vector<T> delta_p = sampleVectorWithParty(p, n);
+          auto& missing = missing_delta_flat[static_cast<size_t>(final_party)];
+          const size_t base = missing.size();
+          missing.resize(base + n);
           #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
           for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
             const size_t j = static_cast<size_t>(jj);
-            delta_sum[j] += delta_p[j];
+            missing[base + j] = delta[j] - delta_sum[j];
           }
         }
 
-        auto& missing = missing_delta_flat[static_cast<size_t>(final_party)];
-        const size_t base = missing.size();
-        missing.resize(base + n);
-        #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
-        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
-          const size_t j = static_cast<size_t>(jj);
-          missing[base + j] = delta[j] - delta_sum[j];
-        }
-
-        if (isTwoPartyOptimizedPermutationGate(gate)) {
-          const std::vector<size_t>& pi0 =
-              permutationForParty(gate, 0, perm_cache, fresh_group);
-          const std::vector<size_t>& pi1 =
-              permutationForParty(gate, 1, perm_cache, fresh_group);
-          const std::vector<size_t> base_pi = composePerm(pi0, pi1);
-          const std::vector<size_t> target_pi =
-              inverse ? invertPerm(base_pi) : base_pi;
-
-          // Forward shuffle: P0 samples the first split permutation and P1 gets
-          // the derived second split.  Unshuffle inverts the base permutation:
-          // P0 samples the second split and P1 gets the derived first split.
-          const std::vector<size_t> p0_aux = samplePermutationWithParty(0, n);
-          const std::vector<size_t> p1_aux =
-              inverse ? deriveLeftPerm(target_pi, p0_aux)
-                      : deriveRightPerm(target_pi, p0_aux);
+        if (optimized) {
+          const auto& opt_material =
+              helperTwoPartyOptimizedMaterialForGate(
+                  gate, inverse, perm_cache, fresh_group);
 
           std::vector<T> rerandomizer(n);
           helper_local_prg.random_data(rerandomizer.data(), n * sizeof(T));
-
-          const std::vector<T> target_R1 =
-              applyPerm(target_pi, opening_masks[static_cast<size_t>(1)]);
-          const std::vector<T> target_R0 =
-              applyPerm(target_pi, opening_masks[static_cast<size_t>(0)]);
 
           const size_t old_p0 = two_party_mask_p0.size();
           const size_t old_p1 = two_party_mask_p1.size();
@@ -978,9 +1188,12 @@ class OfflineEvaluator {
           #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
           for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
             const size_t j = static_cast<size_t>(jj);
-            two_party_mask_p0[old_p0 + j] = target_R1[j] - rerandomizer[j];
-            two_party_mask_p1[old_p1 + j] = target_R0[j] + rerandomizer[j];
-            two_party_perm_p1[old_perm + j] = p1_aux[j];
+            const size_t src = opt_material.target_pi[j];
+            two_party_mask_p0[old_p0 + j] =
+                opening_masks[static_cast<size_t>(1)][src] - rerandomizer[j];
+            two_party_mask_p1[old_p1 + j] =
+                opening_masks[static_cast<size_t>(0)][src] + rerandomizer[j];
+            two_party_perm_p1[old_perm + j] = opt_material.p1_aux[j];
           }
         }
       } else {
@@ -995,21 +1208,13 @@ class OfflineEvaluator {
         pp.local_perm = localPermutationForGate(gate, perm_cache, fresh_group);
 
         pp.opening_mask_share = sampleVectorWithParty(helper, n);
-        pp.chain_mask = sampleVectorWithParty(helper, n);
 
-        if (pid_ == final_party) {
-          pp.delta_share.assign(
-              received_missing_delta.begin() + static_cast<std::ptrdiff_t>(received_delta_offset),
-              received_missing_delta.begin() + static_cast<std::ptrdiff_t>(received_delta_offset + n));
-          received_delta_offset += n;
-        } else {
-          pp.delta_share = sampleVectorWithParty(helper, n);
-        }
-
-        if (isTwoPartyOptimizedPermutationGate(gate)) {
+        if (optimized) {
           pp.two_party_optimized = true;
           if (pid_ == 0) {
-            pp.two_party_aux_perm = samplePermutationWithParty(helper, n);
+            pp.two_party_aux_perm =
+                *twoPartyAuxPermutationForGate(
+                    gate, inverse, perm_cache, fresh_group);
           } else {
             pp.two_party_aux_perm.assign(
                 received_two_party_perm.begin() +
@@ -1027,6 +1232,19 @@ class OfflineEvaluator {
               received_two_party_mask.begin() +
                   static_cast<std::ptrdiff_t>(received_two_party_mask_offset + n));
           received_two_party_mask_offset += n;
+
+          populateTwoPartyOptimizedOnlineMaps(pp);
+        } else {
+          pp.chain_mask = sampleVectorWithParty(helper, n);
+
+          if (pid_ == final_party) {
+            pp.delta_share.assign(
+                received_missing_delta.begin() + static_cast<std::ptrdiff_t>(received_delta_offset),
+                received_missing_delta.begin() + static_cast<std::ptrdiff_t>(received_delta_offset + n));
+            received_delta_offset += n;
+          } else {
+            pp.delta_share = sampleVectorWithParty(helper, n);
+          }
         }
 
         preproc_.shuffles.push_back(std::move(pp));

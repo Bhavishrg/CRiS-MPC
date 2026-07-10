@@ -73,6 +73,14 @@ struct ShuffleGatePreproc {
   std::vector<size_t> two_party_aux_perm;
   std::vector<size_t> two_party_final_perm;
   std::vector<T> two_party_output_mask;
+
+  // Online hot-path maps derived during preprocessing.  They flatten the
+  // local/aux/final permutation composition so optimized online shuffle only
+  // performs direct indexed loads.
+  std::vector<size_t> two_party_send_src_idx;
+  std::vector<size_t> two_party_send_mask_idx;
+  std::vector<size_t> two_party_recv_src_idx;
+  std::vector<size_t> two_party_recv_mask_idx;
 };
 
 /**
