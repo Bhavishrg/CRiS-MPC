@@ -459,6 +459,7 @@ class OfflineEvaluator {
           case GateType::kEqz:
           case GateType::kRec:
           case GateType::kShuffle:
+          case GateType::kLocalPerm:
             break;
 
           case GateType::kPermSh: {
@@ -490,10 +491,6 @@ class OfflineEvaluator {
             }
             break;
           }
-
-          case GateType::kLocalPerm:
-            throw std::runtime_error(
-                "NPH protocol: kLocalPerm is not implemented yet");
 
           default:
             throw std::runtime_error("NPH protocol: unknown or invalid gate type");

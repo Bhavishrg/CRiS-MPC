@@ -210,6 +210,8 @@ class OnlineEvaluator {
   bool pking_{false};
   bool disable_optimized_shuffle_{false};
   std::vector<AdditiveShare<T>> wires_;
+  std::vector<T> public_values_;
+  std::vector<unsigned char> public_value_known_;
   std::unordered_map<wire_t, T> inputs_;
   size_t triple_pos_{0};
   size_t eqz_pos_{0};
@@ -226,6 +228,8 @@ class OnlineEvaluator {
   void initializeEvaluation(const LevelOrderedCircuit& lc) {
     validateSupported(lc);
     wires_.assign(lc.num_wires, AdditiveShare<T>{});
+    public_values_.assign(lc.num_wires, T{});
+    public_value_known_.assign(lc.num_wires, 0);
     triple_pos_ = 0;
     eqz_pos_ = 0;
     shuffle_pos_ = 0;
@@ -291,6 +295,7 @@ class OnlineEvaluator {
           case GateType::kEqz:
           case GateType::kRec:
           case GateType::kShuffle:
+          case GateType::kLocalPerm:
             break;
 
           case GateType::kPermSh: {
@@ -322,10 +327,6 @@ class OnlineEvaluator {
             }
             break;
           }
-
-          case GateType::kLocalPerm:
-            throw std::runtime_error(
-                "NPH protocol: kLocalPerm is not implemented yet");
 
           default:
             throw std::runtime_error("NPH protocol: unknown or invalid gate type");
@@ -384,10 +385,50 @@ class OnlineEvaluator {
       }
 
       case GateType::kLocalPerm:
-        throw std::runtime_error("NPH protocol: kLocalPerm is not implemented");
+        evalLocalPermGate(static_cast<const LocalPermGate&>(gate));
+        break;
 
       default:
         break;
+    }
+  }
+
+  T publicPermValue(wire_t w) const {
+    if (w >= public_value_known_.size() || !public_value_known_[w]) {
+      throw std::runtime_error(
+          "NPH evalLocalPermGate: permutation wire is not reconstructed/public");
+    }
+    return public_values_[w];
+  }
+
+  void evalLocalPermGate(const LocalPermGate& g) {
+    const size_t n = g.payload.size();
+    if (n == 0 || g.perm_wires.size() != n || g.outs.size() != n) {
+      throw std::runtime_error("NPH evalLocalPermGate: malformed kLocalPerm gate");
+    }
+
+    std::vector<size_t> perm(n);
+    for (size_t j = 0; j < n; ++j) {
+      perm[j] = static_cast<size_t>(publicPermValue(g.perm_wires[j]));
+      if (perm[j] >= n) {
+        throw std::runtime_error("NPH evalLocalPermGate: permutation index out of range");
+      }
+    }
+
+    if (!g.inv) {
+      // Pull: out[j] = payload[perm[j]].
+      #pragma omp parallel for if(n >= kParallelLocalGateThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        wires_[g.outs[j]] = wires_[g.payload[perm[j]]];
+      }
+    } else {
+      // Push: out[perm[j]] = payload[j].
+      #pragma omp parallel for if(n >= kParallelLocalGateThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        wires_[g.outs[perm[j]]] = wires_[g.payload[j]];
+      }
     }
   }
 
@@ -1244,6 +1285,8 @@ class OnlineEvaluator {
     for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
       const size_t i = static_cast<size_t>(ii);
       wires_[gates[i]->out] = publicConstantShare<T>(plain[i], pid_);
+      public_values_[gates[i]->out] = plain[i];
+      public_value_known_[gates[i]->out] = 1;
     }
   }
 
