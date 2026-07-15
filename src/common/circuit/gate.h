@@ -21,6 +21,7 @@ enum class GateType {
   kShuffle,    // interactive: secretly apply grouped/random shuffle permutation
   kUnshuffle,  // interactive: apply inverse of a grouped shuffle permutation
   kPermSh,      // interactive: target-party random permutation shuffle
+  kAmorPermShare, // interactive: amortised permute+share for all compute parties
   kLocalPerm,   // local:       permute payload wires by index wires (no communication)
   kInvalid,
   NumGates
@@ -151,6 +152,36 @@ struct PermShGate : public Gate {
       : Gate{GateType::kPermSh, outs.empty() ? 0 : outs[0], target},
         ins{std::move(ins)}, outs{std::move(outs)},
         target{target}, perm_group_id{perm_group_id} {}
+};
+
+// ── AmorPermShare gate: kAmorPermShare ───────────────────────────────────────
+// NPH-only gate for GraSP's Amortised Permute + Share primitive.
+//
+// Given one shared list T of size n, this gate outputs one shared list per
+// compute party:
+//
+//   outs[p] = pi_p(T)
+//
+// where pi_p is a hidden random permutation known only to compute party p.
+// The online protocol reconstructs one masked list T + R to all parties, and
+// every party derives its output share for each pi_p(T) by subtracting shares
+// of pi_p(R).
+//
+// perm_group_id: if >= 0, gates with the same group id and vector size reuse
+// the same hidden pi_p for every compute party.  Masks are fresh per gate.
+struct AmorPermShareGate : public Gate {
+  std::vector<wire_t> ins;
+  std::vector<std::vector<wire_t>> outs;  // outs[party][i]
+  int perm_group_id{-1};
+
+  AmorPermShareGate() : Gate{GateType::kAmorPermShare, 0} {}
+  AmorPermShareGate(std::vector<wire_t> ins,
+                    std::vector<std::vector<wire_t>> outs,
+                    int perm_group_id = -1)
+      : Gate{GateType::kAmorPermShare,
+             (outs.empty() || outs[0].empty()) ? 0 : outs[0][0]},
+        ins{std::move(ins)}, outs{std::move(outs)},
+        perm_group_id{perm_group_id} {}
 };
 
 // ── LocalPerm gate: kLocalPerm ───────────────────────────────────────────────

@@ -73,11 +73,14 @@ class OfflineEvaluator {
         lc.count[static_cast<size_t>(GateType::kEqz)];
     const std::vector<const Gate*> shuffle_gates = collectPermutationGates(lc);
     const std::vector<const PermShGate*> permsh_gates = collectPermShGates(lc);
+    const std::vector<const AmorPermShareGate*> amor_gates =
+        collectAmorPermShareGates(lc);
 
     preproc_.triples.clear();
     preproc_.eqz.clear();
     preproc_.shuffles.clear();
     preproc_.permsh.clear();
+    preproc_.amor_permshare.clear();
 
     if (is_helper()) {
       if (num_triples != 0) helperGenerateTriples(num_triples);
@@ -87,6 +90,7 @@ class OfflineEvaluator {
       preproc_.eqz.resize(num_eqz);
       preproc_.shuffles.reserve(shuffle_gates.size());
       preproc_.permsh.reserve(permsh_gates.size());
+      preproc_.amor_permshare.reserve(amor_gates.size());
 
       if (num_triples != 0) computeGenerateTriples(num_triples);
       if (num_eqz != 0) computeGenerateEqz(num_eqz);
@@ -97,6 +101,7 @@ class OfflineEvaluator {
     // compute parties derive/store their local ShuffleGatePreproc entries.
     if (!shuffle_gates.empty()) generateShuffles(shuffle_gates);
     if (!permsh_gates.empty()) generatePermShuffles(permsh_gates);
+    if (!amor_gates.empty()) generateAmorPermShares(amor_gates);
   }
 
   Preprocessing<T> take_preprocessing() { return std::move(preproc_); }
@@ -141,6 +146,13 @@ class OfflineEvaluator {
     int target{-1};
 
     std::vector<size_t> helper_perm;
+    std::shared_ptr<const std::vector<size_t>> local_perm;
+  };
+
+  struct AmorPermSharePermGroup {
+    size_t vec_size{0};
+
+    std::vector<std::vector<size_t>> helper_perms;
     std::shared_ptr<const std::vector<size_t>> local_perm;
   };
 
@@ -436,6 +448,19 @@ class OfflineEvaluator {
     return gates;
   }
 
+  static std::vector<const AmorPermShareGate*> collectAmorPermShareGates(
+      const LevelOrderedCircuit& lc) {
+    std::vector<const AmorPermShareGate*> gates;
+    for (const auto& level : lc.gates_by_level) {
+      for (const auto& gp : level) {
+        if (gp->type == GateType::kAmorPermShare) {
+          gates.push_back(static_cast<const AmorPermShareGate*>(gp.get()));
+        }
+      }
+    }
+    return gates;
+  }
+
   void validateSupported(const LevelOrderedCircuit& lc) const {
     for (const auto& level : lc.gates_by_level) {
       for (const auto& gp : level) {
@@ -470,6 +495,24 @@ class OfflineEvaluator {
             }
             if (g.ins.empty() || g.outs.size() != g.ins.size()) {
               throw std::runtime_error("NPH protocol: malformed kPermSh gate");
+            }
+            break;
+          }
+
+          case GateType::kAmorPermShare: {
+            const auto& g = static_cast<const AmorPermShareGate&>(*gp);
+            if (g.ins.empty()) {
+              throw std::runtime_error("NPH protocol: malformed kAmorPermShare gate");
+            }
+            if (g.outs.size() != static_cast<size_t>(num_compute_parties_)) {
+              throw std::runtime_error(
+                  "NPH protocol: kAmorPermShare must have one output list per compute party");
+            }
+            for (const auto& outs : g.outs) {
+              if (outs.size() != g.ins.size()) {
+                throw std::runtime_error(
+                    "NPH protocol: malformed kAmorPermShare output list");
+              }
             }
             break;
           }
@@ -1004,6 +1047,56 @@ class OfflineEvaluator {
     return group->local_perm;
   }
 
+  AmorPermSharePermGroup makeFreshAmorPermSharePermGroup(size_t n) {
+    AmorPermSharePermGroup group;
+    group.vec_size = n;
+
+    if (is_helper()) {
+      group.helper_perms.resize(static_cast<size_t>(num_compute_parties_));
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        group.helper_perms[static_cast<size_t>(p)] =
+            samplePermutationWithParty(p, n);
+      }
+    } else {
+      group.local_perm = std::make_shared<std::vector<size_t>>(
+          samplePermutationWithParty(helper_pid(), n));
+    }
+
+    return group;
+  }
+
+  AmorPermSharePermGroup& getOrCreateAmorPermSharePermGroup(
+      int gid,
+      size_t n,
+      std::unordered_map<int, AmorPermSharePermGroup>& cache) {
+    auto it = cache.find(gid);
+    if (it != cache.end()) {
+      if (it->second.vec_size != n) {
+        throw std::runtime_error(
+            "NPH kAmorPermShare preprocessing: same perm_group_id reused with different size");
+      }
+      return it->second;
+    }
+
+    auto inserted = cache.emplace(gid, makeFreshAmorPermSharePermGroup(n));
+    return inserted.first->second;
+  }
+
+  AmorPermSharePermGroup& getAmorPermSharePermGroup(
+      const AmorPermShareGate& gate,
+      std::unordered_map<int, AmorPermSharePermGroup>& cache,
+      AmorPermSharePermGroup& fresh_group) {
+    const size_t n = gate.ins.size();
+    if (gate.perm_group_id >= 0) {
+      return getOrCreateAmorPermSharePermGroup(gate.perm_group_id, n, cache);
+    }
+
+    if (fresh_group.vec_size == 0) {
+      fresh_group = makeFreshAmorPermSharePermGroup(n);
+    }
+    return fresh_group;
+  }
+
   void generateShuffles(const std::vector<const Gate*>& gates) {
     const int helper = helper_pid();
     const int last = last_compute_pid();
@@ -1358,6 +1451,141 @@ class OfflineEvaluator {
         }
 
         preproc_.permsh.push_back(std::move(pp));
+      }
+    }
+
+    if (is_helper()) {
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        const auto& buf = missing_flat[static_cast<size_t>(p)];
+        if (!buf.empty()) {
+          net_.send_ring<T>(buf.data(), buf.size(), p);
+          net_.flush(p);
+        }
+      }
+    }
+  }
+
+  void generateAmorPermShares(const std::vector<const AmorPermShareGate*>& gates) {
+    const int helper = helper_pid();
+
+    std::vector<size_t> missing_elems(static_cast<size_t>(num_compute_parties_), 0);
+    for (const auto* g : gates) {
+      const size_t n = g->ins.size();
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        missing_elems[static_cast<size_t>(p)] += n;
+      }
+    }
+
+    std::vector<std::vector<T>> missing_flat(static_cast<size_t>(num_compute_parties_));
+    std::vector<T> received_missing;
+
+    if (is_helper()) {
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        missing_flat[static_cast<size_t>(p)].reserve(
+            missing_elems[static_cast<size_t>(p)]);
+      }
+    } else {
+      const size_t my_missing = missing_elems[static_cast<size_t>(pid_)];
+      if (my_missing != 0) {
+        received_missing.resize(my_missing);
+        net_.recv_ring<T>(received_missing.data(), received_missing.size(), helper);
+      }
+    }
+
+    std::unordered_map<int, AmorPermSharePermGroup> perm_cache;
+    size_t received_offset = 0;
+
+    for (const AmorPermShareGate* gate_ptr : gates) {
+      const AmorPermShareGate& gate = *gate_ptr;
+      const size_t n = gate.ins.size();
+      if (n == 0 ||
+          gate.outs.size() != static_cast<size_t>(num_compute_parties_)) {
+        throw std::runtime_error("NPH kAmorPermShare preprocessing: malformed gate");
+      }
+      for (const auto& outs : gate.outs) {
+        if (outs.size() != n) {
+          throw std::runtime_error(
+              "NPH kAmorPermShare preprocessing: malformed output list");
+        }
+      }
+
+      AmorPermSharePermGroup fresh_group;
+      AmorPermSharePermGroup& group =
+          getAmorPermSharePermGroup(gate, perm_cache, fresh_group);
+
+      if (is_helper()) {
+        if (group.helper_perms.size() != static_cast<size_t>(num_compute_parties_)) {
+          throw std::runtime_error(
+              "NPH kAmorPermShare preprocessing: missing helper permutations");
+        }
+        for (const auto& pi : group.helper_perms) {
+          if (pi.size() != n) {
+            throw std::runtime_error(
+                "NPH kAmorPermShare preprocessing: helper permutation size mismatch");
+          }
+        }
+
+        std::vector<T> R(n, T{});
+        for (int p = 0; p < num_compute_parties_; ++p) {
+          const std::vector<T> r_p = sampleVectorWithParty(p, n);
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            R[j] += r_p[j];
+          }
+        }
+
+        for (int target = 0; target < num_compute_parties_; ++target) {
+          const std::vector<T> pi_R =
+              applyPerm(group.helper_perms[static_cast<size_t>(target)], R);
+          std::vector<T> pi_R_sum(n, T{});
+
+          for (int p = 0; p < num_compute_parties_; ++p) {
+            if (p == target) continue;
+            const std::vector<T> share_p = sampleVectorWithParty(p, n);
+            #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+            for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+              const size_t j = static_cast<size_t>(jj);
+              pi_R_sum[j] += share_p[j];
+            }
+          }
+
+          auto& missing = missing_flat[static_cast<size_t>(target)];
+          const size_t base = missing.size();
+          missing.resize(base + n);
+          #pragma omp parallel for if(n >= kParallelPreprocThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            missing[base + j] = pi_R[j] - pi_R_sum[j];
+          }
+        }
+      } else {
+        if (!group.local_perm || group.local_perm->size() != n) {
+          throw std::runtime_error(
+              "NPH kAmorPermShare preprocessing: missing local permutation");
+        }
+
+        AmorPermShareGatePreproc<T> pp;
+        pp.perm_group_id = gate.perm_group_id;
+        pp.vec_size = n;
+        pp.num_outputs = static_cast<size_t>(num_compute_parties_);
+        pp.local_perm = group.local_perm;
+        pp.opening_mask_share = sampleVectorWithParty(helper, n);
+        pp.permuted_mask_shares.resize(static_cast<size_t>(num_compute_parties_));
+
+        for (int target = 0; target < num_compute_parties_; ++target) {
+          auto& target_share = pp.permuted_mask_shares[static_cast<size_t>(target)];
+          if (pid_ == target) {
+            target_share.assign(
+                received_missing.begin() + static_cast<std::ptrdiff_t>(received_offset),
+                received_missing.begin() + static_cast<std::ptrdiff_t>(received_offset + n));
+            received_offset += n;
+          } else {
+            target_share = sampleVectorWithParty(helper, n);
+          }
+        }
+
+        preproc_.amor_permshare.push_back(std::move(pp));
       }
     }
 

@@ -23,8 +23,12 @@ if [ $# -lt 1 ]; then
     echo "  - bench_linear"
     echo "  - bench_mult"
     echo "  - bench_permsh"
+    echo "  - bench_amor_permshare"
     echo "  - bench_propagate"
     echo "  - bench_unshuffle"
+    echo "  - bench_bfs_mpa"
+    echo "  - bench_pagerank_mpa"
+    echo "  - bench_dcc_pagerank_mpa"
     echo "  - bench_sort"
     echo ""
     echo "Examples:"
@@ -46,7 +50,7 @@ normalize_benchmark_args() {
     local -a normalized=("$@")
 
     case "$benchmark_name" in
-        bench_mult|bench_linear|bench_gate|bench_permsh|bench_unshuffle)
+        bench_mult|bench_linear|bench_gate|bench_permsh|bench_amor_permshare|bench_unshuffle)
             if [ ${#normalized[@]} -gt 0 ] && [[ ! "${normalized[0]}" =~ ^-- ]]; then
                 normalized=("--vec-size" "${normalized[0]}" "${normalized[@]:1}")
             fi
@@ -129,6 +133,9 @@ DEFAULT_PEER="127.0.0.1"
 protocol="$DEFAULT_PROTOCOL"
 num_parties="$DEFAULT_NUM_PARTIES"
 vec_size="unspecified_vec_size"
+graph_size="unspecified_graph_size"
+num_verts="unspecified_num_verts"
+num_edges="unspecified_num_edges"
 num_groups="unspecified_num_groups"
 bit_width="unspecified_bit_width"
 port="$DEFAULT_PORT"
@@ -156,6 +163,21 @@ for ((i=0; i<${#BENCHMARK_OPTS[@]}; i++)); do
         --vec-size|-v)
             if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
                 vec_size="${BENCHMARK_OPTS[$((i+1))]}"
+            fi
+            ;;
+        --graph-size)
+            if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
+                graph_size="${BENCHMARK_OPTS[$((i+1))]}"
+            fi
+            ;;
+        --num-verts)
+            if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
+                num_verts="${BENCHMARK_OPTS[$((i+1))]}"
+            fi
+            ;;
+        --num-edges)
+            if (( i + 1 < ${#BENCHMARK_OPTS[@]} )); then
+                num_edges="${BENCHMARK_OPTS[$((i+1))]}"
             fi
             ;;
         --num-groups|-g)
@@ -232,6 +254,13 @@ RESULTS_BASE="${RESULTS_DIR:-$REPO_ROOT/benchmark/Results}"
 case "$BENCHMARK_NAME" in
     bench_sort)
         shape_dir="vec_${vec_size}/bits_${bit_width}"
+        ;;
+    bench_bfs_mpa|bench_pagerank_mpa|bench_dcc_pagerank_mpa)
+        if [ "$graph_size" != "unspecified_graph_size" ]; then
+            shape_dir="graph_${graph_size}"
+        else
+            shape_dir="verts_${num_verts}/edges_${num_edges}"
+        fi
         ;;
     *)
         shape_dir="vec_${vec_size}/groups_${num_groups}"
@@ -331,7 +360,7 @@ summary_file="$logdir/summary.txt"
         log="$logdir/party_${party}.log"
 
         echo "----- party $party -----"
-        grep -E "correctness|PASS|FAIL|SKIP|offline|online|total|time|sent|recv|Peak" "$log" || true
+        grep -E "correctness|PASS|FAIL|SKIP|offline|init|online|total|time|sent|recv|Peak" "$log" || true
         echo ""
     done
 } > "$summary_file"

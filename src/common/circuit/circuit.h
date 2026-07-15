@@ -253,6 +253,43 @@ class Circuit {
     return outs;
   }
 
+  // ── AmorPermShare gate: kAmorPermShare ─────────────────────────────────
+
+  /**
+   * NPH-only amortised permute+share gate.
+   *
+   * Given one input list `ins`, outputs one permuted sharing per compute party:
+   *
+   *   outs[p] = pi_p(ins)
+   *
+   * where pi_p is a hidden random permutation known only to party p.
+   *
+   * Gates sharing the same non-negative `perm_group_id` reuse the same hidden
+   * pi_p for every party when the vector size also matches.  Fresh masks are
+   * still sampled independently for every gate.
+   */
+  std::vector<std::vector<wire_t>> addAmorPermShareGate(
+      const std::vector<wire_t>& ins,
+      int num_compute_parties,
+      int perm_group_id = -1) {
+    if (ins.empty())
+      throw std::invalid_argument("addAmorPermShareGate: ins must be non-empty");
+    if (num_compute_parties <= 0)
+      throw std::invalid_argument("addAmorPermShareGate: num_compute_parties must be positive");
+    for (wire_t w : ins) checkWire(w);
+
+    std::vector<std::vector<wire_t>> outs(
+        static_cast<size_t>(num_compute_parties),
+        std::vector<wire_t>(ins.size()));
+    for (auto& party_outs : outs) {
+      for (wire_t& w : party_outs) w = num_wires_++;
+    }
+
+    gates_.push_back(
+        std::make_shared<AmorPermShareGate>(ins, outs, perm_group_id));
+    return outs;
+  }
+
   // ── LocalPerm gate: kLocalPerm ────────────────────────────────────────
 
   /**
@@ -1219,6 +1256,14 @@ class Circuit {
           wdepth[w] = d;
           wlocal_rank[w] = 0;
         }
+      } else if (gp->type == GateType::kAmorPermShare) {
+        const auto& ag = static_cast<const AmorPermShareGate&>(*gp);
+        for (const auto& party_outs : ag.outs) {
+          for (wire_t w : party_outs) {
+            wdepth[w] = d;
+            wlocal_rank[w] = 0;
+          }
+        }
       } else if (gp->type == GateType::kLocalPerm) {
         const auto& lg = static_cast<const LocalPermGate&>(*gp);
         for (wire_t w : lg.outs) {
@@ -1271,7 +1316,8 @@ class Circuit {
            t == GateType::kRecP    ||
            t == GateType::kShuffle ||
            t == GateType::kUnshuffle ||
-           t == GateType::kPermSh;
+           t == GateType::kPermSh ||
+           t == GateType::kAmorPermShare;
   }
 
   static bool isLocal(GateType t) {
@@ -1382,6 +1428,14 @@ class Circuit {
         size_t d = 0;
         for (wire_t w : pg.ins) d = std::max(d, wdepth[w]);
         return d + 1;
+      }
+
+      case GateType::kAmorPermShare: {
+        // Reconstruct X + R to all parties with a king-party exchange.
+        const auto& ag = static_cast<const AmorPermShareGate&>(g);
+        size_t d = 0;
+        for (wire_t w : ag.ins) d = std::max(d, wdepth[w]);
+        return d + 2;
       }
 
       case GateType::kLocalPerm: {

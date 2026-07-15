@@ -141,6 +141,7 @@ class OnlineEvaluator {
         case GateType::kShuffle:
         case GateType::kUnshuffle:
         case GateType::kPermSh:
+        case GateType::kAmorPermShare:
           append_permutation_gate(gp.get());
           break;
         default:
@@ -173,6 +174,12 @@ class OnlineEvaluator {
         for (const Gate* g : run.second)
           gates.push_back(static_cast<const PermShGate*>(g));
         batchPermSh(gates);
+      } else if (run.first == GateType::kAmorPermShare) {
+        std::vector<const AmorPermShareGate*> gates;
+        gates.reserve(run.second.size());
+        for (const Gate* g : run.second)
+          gates.push_back(static_cast<const AmorPermShareGate*>(g));
+        batchAmorPermShare(gates);
       } else {
         throw std::logic_error("NPH OnlineEvaluator: unexpected permutation run type");
       }
@@ -217,6 +224,7 @@ class OnlineEvaluator {
   size_t eqz_pos_{0};
   size_t shuffle_pos_{0};
   size_t permsh_pos_{0};
+  size_t amor_permshare_pos_{0};
   bool evaluation_initialized_{false};
 
   static constexpr size_t kParallelInteractiveThreshold = 8192;
@@ -234,6 +242,7 @@ class OnlineEvaluator {
     eqz_pos_ = 0;
     shuffle_pos_ = 0;
     permsh_pos_ = 0;
+    amor_permshare_pos_ = 0;
     evaluation_initialized_ = true;
   }
 
@@ -249,6 +258,10 @@ class OnlineEvaluator {
     }
     if (permsh_pos_ != preproc_.permsh.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused kPermSh preprocessing after evaluation");
+    }
+    if (amor_permshare_pos_ != preproc_.amor_permshare.size()) {
+      throw std::runtime_error(
+          "NPH OnlineEvaluator: unused kAmorPermShare preprocessing after evaluation");
     }
   }
 
@@ -306,6 +319,24 @@ class OnlineEvaluator {
             }
             if (g.ins.empty() || g.outs.size() != g.ins.size()) {
               throw std::runtime_error("NPH protocol: malformed kPermSh gate");
+            }
+            break;
+          }
+
+          case GateType::kAmorPermShare: {
+            const auto& g = static_cast<const AmorPermShareGate&>(*gp);
+            if (g.ins.empty()) {
+              throw std::runtime_error("NPH protocol: malformed kAmorPermShare gate");
+            }
+            if (g.outs.size() != static_cast<size_t>(num_compute_parties_)) {
+              throw std::runtime_error(
+                  "NPH protocol: kAmorPermShare must have one output list per compute party");
+            }
+            for (const auto& outs : g.outs) {
+              if (outs.size() != g.ins.size()) {
+                throw std::runtime_error(
+                    "NPH protocol: malformed kAmorPermShare output list");
+              }
             }
             break;
           }
@@ -1155,6 +1186,115 @@ class OnlineEvaluator {
     }
 
     permsh_pos_ += G;
+  }
+
+  void batchAmorPermShare(const std::vector<const AmorPermShareGate*>& gates) {
+    if (gates.empty()) return;
+
+    const size_t G = gates.size();
+    if (amor_permshare_pos_ + G > preproc_.amor_permshare.size()) {
+      throw std::runtime_error(
+          "NPH OnlineEvaluator: not enough kAmorPermShare preprocessing");
+    }
+
+    std::vector<const AmorPermShareGatePreproc<T>*> pps(G, nullptr);
+    size_t total_elems = 0;
+
+    for (size_t gi = 0; gi < G; ++gi) {
+      const AmorPermShareGate& g = *gates[gi];
+      const AmorPermShareGatePreproc<T>& pp =
+          preproc_.amor_permshare[amor_permshare_pos_ + gi];
+      const size_t n = g.ins.size();
+
+      if (n == 0 ||
+          g.outs.size() != static_cast<size_t>(num_compute_parties_)) {
+        throw std::runtime_error("NPH batchAmorPermShare: malformed gate");
+      }
+      for (const auto& outs : g.outs) {
+        if (outs.size() != n) {
+          throw std::runtime_error("NPH batchAmorPermShare: malformed output list");
+        }
+      }
+      if (pp.perm_group_id != g.perm_group_id ||
+          pp.vec_size != n ||
+          pp.num_outputs != static_cast<size_t>(num_compute_parties_) ||
+          pp.opening_mask_share.size() != n ||
+          pp.permuted_mask_shares.size() != static_cast<size_t>(num_compute_parties_) ||
+          !pp.local_perm ||
+          pp.local_perm->size() != n) {
+        throw std::runtime_error("NPH batchAmorPermShare: preprocessing mismatch");
+      }
+      for (const auto& share : pp.permuted_mask_shares) {
+        if (share.size() != n) {
+          throw std::runtime_error("NPH batchAmorPermShare: bad mask-share size");
+        }
+      }
+
+      pps[gi] = &pp;
+      total_elems += n;
+    }
+
+    std::vector<T> masked(total_elems, T{});
+    size_t offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const AmorPermShareGate& g = *gates[gi];
+      const AmorPermShareGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+      const size_t base = offset;
+
+      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        const size_t j = static_cast<size_t>(jj);
+        masked[base + j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
+      }
+
+      offset += n;
+    }
+
+    std::vector<T> opened = reconstruct(masked, true);
+
+    offset = 0;
+    for (size_t gi = 0; gi < G; ++gi) {
+      const AmorPermShareGate& g = *gates[gi];
+      const AmorPermShareGatePreproc<T>& pp = *pps[gi];
+      const size_t n = g.ins.size();
+      const size_t base = offset;
+
+      std::vector<T> my_permuted;
+      if (pid_ >= 0 && pid_ < num_compute_parties_) {
+        std::vector<T> opened_slice(n);
+        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+          const size_t j = static_cast<size_t>(jj);
+          opened_slice[j] = opened[base + j];
+        }
+        my_permuted = applyPerm(*pp.local_perm, opened_slice);
+      }
+
+      for (int target = 0; target < num_compute_parties_; ++target) {
+        const auto& mask_share =
+            pp.permuted_mask_shares[static_cast<size_t>(target)];
+        const auto& outs = g.outs[static_cast<size_t>(target)];
+
+        if (pid_ == target) {
+          #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            wires_[outs[j]] = AdditiveShare<T>(my_permuted[j] - mask_share[j]);
+          }
+        } else {
+          #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            wires_[outs[j]] = AdditiveShare<T>(T{} - mask_share[j]);
+          }
+        }
+      }
+
+      offset += n;
+    }
+
+    amor_permshare_pos_ += G;
   }
 
   void batchEqz(const std::vector<const FIn1Gate*>& gates) {

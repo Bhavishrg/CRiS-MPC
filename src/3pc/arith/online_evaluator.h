@@ -252,6 +252,8 @@ class OnlineEvaluator {
           break;
         case GateType::kPermSh:
           throw std::runtime_error("3PC OnlineEvaluator: kPermSh is only supported by NPH");
+        case GateType::kAmorPermShare:
+          throw std::runtime_error("3PC OnlineEvaluator: kAmorPermShare is only supported by NPH");
         default:
           break;
       }

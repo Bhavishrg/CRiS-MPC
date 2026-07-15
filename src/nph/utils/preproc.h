@@ -100,6 +100,23 @@ struct PermShGatePreproc {
   std::vector<T> permuted_mask_share;  // party share of pi(R)
 };
 
+/**
+ * Per-kAmorPermShare preprocessing material held by one compute party.
+ *
+ * Each compute party stores its share of one opening mask R, its own hidden
+ * local permutation pi_pid, and shares of pi_t(R) for every output list t.
+ */
+template <typename T>
+struct AmorPermShareGatePreproc {
+  int perm_group_id{-1};
+  size_t vec_size{0};
+  size_t num_outputs{0};
+
+  std::shared_ptr<const std::vector<size_t>> local_perm;
+  std::vector<T> opening_mask_share;  // party share of R
+  std::vector<std::vector<T>> permuted_mask_shares;  // [target][i]
+};
+
 /** Preprocessing material consumed by the NPH online evaluator. */
 template <typename T>
 struct Preprocessing {
@@ -107,6 +124,7 @@ struct Preprocessing {
   std::vector<EqzGatePreproc<T>> eqz;
   std::vector<ShuffleGatePreproc<T>> shuffles;
   std::vector<PermShGatePreproc<T>> permsh;
+  std::vector<AmorPermShareGatePreproc<T>> amor_permshare;
 };
 
 }  // namespace threepc::nph
