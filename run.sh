@@ -248,8 +248,8 @@ timestamp=$(date +"%Y%m%d_%H%M%S")
 
 # You can override base results directory:
 #   RESULTS_DIR=/tmp/my_results ./run.sh bench_gate ...
-# By default, store under <repo-root>/benchmark/Results.
-RESULTS_BASE="${RESULTS_DIR:-$REPO_ROOT/benchmark/Results}"
+# By default, store under <repo-root>/Results.
+RESULTS_BASE="${RESULTS_DIR:-$REPO_ROOT/Results}"
 
 case "$BENCHMARK_NAME" in
     bench_sort)
@@ -300,6 +300,23 @@ echo ""
 # --------------------------------------------------------------------
 
 declare -a pids
+
+# All NUM_PROCESSES parties run concurrently on this machine as separate OS
+# processes. Each process's OpenMP runtime defaults to spawning one thread
+# per hardware core (nproc) whenever it hits a parallel region, which causes
+# severe oversubscription when many parties run at once (NUM_PROCESSES *
+# nproc threads competing for nproc cores). Cap each process's OpenMP thread
+# count so the total across all party processes stays close to nproc.
+if [ -z "${OMP_NUM_THREADS:-}" ]; then
+    host_cores="$(nproc 2>/dev/null || echo 1)"
+    per_process_threads=$(( host_cores / NUM_PROCESSES ))
+    if [ "$per_process_threads" -lt 1 ]; then
+        per_process_threads=1
+    fi
+    export OMP_NUM_THREADS="$per_process_threads"
+    echo "OMP_NUM_THREADS not set; defaulting to $OMP_NUM_THREADS per process" \
+         "(host cores: $host_cores, processes: $NUM_PROCESSES)"
+fi
 
 for party in $(seq 0 $((NUM_PROCESSES - 1))); do
     log="$logdir/party_${party}.log"

@@ -916,6 +916,18 @@ static void benchmark(const Args& args) {
     }
 
     net.resetCounters();
+    if (!is_helper) {
+        // Warm up the party-to-party TCP connections right before the
+        // latency-sensitive init reveal so the real transfer does not pay a
+        // cold congestion-window ramp-up cost (Linux resets cwnd after an
+        // idle socket via tcp_slow_start_after_idle).
+        const size_t warmup_bytes =
+            (static_cast<size_t>(args.num_parties) * args.num_vertices +
+             3 * args.graph_size) *
+            sizeof(T);
+        net.warmup(warmup_bytes, args.num_parties);
+        net.resetCounters();
+    }
     std::printf("[P%d] Init...\n", pid);
     SP init_start(net);
     for (size_t level = 0;
