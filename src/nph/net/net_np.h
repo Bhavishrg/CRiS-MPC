@@ -143,45 +143,96 @@ class NetNP {
     std::fill(bytes_recv_.begin(), bytes_recv_.end(), uint64_t{0});
   }
 
+  /**
+   * Send/receive `bytes_per_peer` bytes of dummy data on every directed
+   * socket to this party, restricted to peers with id < peer_limit
+   * (exclusive). Pass the number of compute parties here to warm up only
+   * the compute-party mesh/star connections without requiring the helper
+   * (which does not call this) to participate.
+   *
+   * Linux resets the TCP congestion window after a socket goes idle
+   * (net.ipv4.tcp_slow_start_after_idle, on by default). If a socket's first
+   * real bulk transfer happens after an idle gap (e.g. after a CPU-bound
+   * preprocessing phase), that transfer pays the full slow-start ramp-up
+   * cost under high RTT before reaching its steady-state throughput. Calling
+   * this immediately before a latency-sensitive bulk phase keeps the
+   * connection "hot" so the real transfer does not have to re-ramp from a
+   * cold congestion window. Byte counters are not affected — call
+   * resetCounters() after this if a clean slate is desired.
+   */
+  void warmup(size_t bytes_per_peer, int peer_limit) {
+    if (bytes_per_peer == 0) return;
+    if (peer_limit < 0 || peer_limit > total_parties_)
+      throw std::invalid_argument("NetNP::warmup: invalid peer_limit");
+    if (pid_ >= peer_limit) return;
+
+    std::vector<uint8_t> send_buf(bytes_per_peer, 0);
+    for (int to = 0; to < peer_limit; ++to) {
+      if (to == pid_) continue;
+      send_bytes(send_buf.data(), send_buf.size(), to);
+    }
+    flush();
+
+    std::vector<uint8_t> recv_buf(bytes_per_peer);
+    for (int from = 0; from < peer_limit; ++from) {
+      if (from == pid_) continue;
+      recv_bytes(recv_buf.data(), recv_buf.size(), from);
+    }
+  }
+
+  /**
+   * Set SO_SNDBUF and SO_RCVBUF on every socket owned by this party to
+   * `buffer_size` bytes. emp::NetIO exposes the underlying fd via its
+   * public `consocket` member, so this sets the option directly.
+   *
+   * The kernel may cap the value at net.core.{r,w}mem_max (and doubles
+   * whatever it grants for bookkeeping overhead); if large sends/recvs
+   * still stall under high-latency/bandwidth-limited networks, raise
+   * those sysctls too, e.g.:
+   *   sudo sysctl -w net.core.rmem_max=<bytes> net.core.wmem_max=<bytes>
+   *
+   * Call immediately after construction, before any data is exchanged.
+   */
   void increaseSocketBuffers(int buffer_size) {
-    bool first = true;
-
-    auto tune = [&](emp::NetIO* io) {
-      if (!io || io->sock < 0) return;
-      int fd = io->sock;
-      int r1 = ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF,
-                            &buffer_size, sizeof(buffer_size));
-      int r2 = ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-                            &buffer_size, sizeof(buffer_size));
-
-      if (first) {
-        first = false;
-        if (r1 != 0 || r2 != 0) {
-          std::fprintf(stderr,
-              "[NetNP P%d] Warning: setsockopt failed (errno %d: %s)\n",
-              pid_, errno, std::strerror(errno));
-        }
-
-        int actual_snd = 0, actual_rcv = 0;
-        socklen_t optlen = sizeof(int);
-        ::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen);
-        ::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen);
-
-        std::printf("[NetNP P%d] Socket buffers — requested: %d B | "
-                    "actual: SNDBUF=%d B  RCVBUF=%d B\n",
-                    pid_, buffer_size, actual_snd, actual_rcv);
-
-        if (actual_snd < buffer_size || actual_rcv < buffer_size) {
-          std::fprintf(stderr,
-              "[NetNP P%d] Warning: buffers capped by system limits. "
-              "Consider: --sysctl net.core.rmem_max=%d --sysctl net.core.wmem_max=%d\n",
-              pid_, buffer_size, buffer_size);
-        }
+    auto set_buf = [&](emp::NetIO* io, int party) {
+      if (io == nullptr || io->consocket < 0) return;
+      const int fd = io->consocket;
+      if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+        std::fprintf(stderr,
+            "[NetNP P%d] setsockopt(SO_SNDBUF) to party %d failed: %s\n",
+            pid_, party, std::strerror(errno));
+      }
+      if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+        std::fprintf(stderr,
+            "[NetNP P%d] setsockopt(SO_RCVBUF) to party %d failed: %s\n",
+            pid_, party, std::strerror(errno));
       }
     };
 
-    for (auto* io : send_ios_) tune(io);
-    for (auto* io : recv_ios_) tune(io);
+    for (int to = 0; to < total_parties_; ++to) {
+      if (to == pid_) continue;
+      set_buf(send_ios_[static_cast<size_t>(to)], to);
+    }
+    for (int from = 0; from < total_parties_; ++from) {
+      if (from == pid_) continue;
+      set_buf(recv_ios_[static_cast<size_t>(from)], from);
+    }
+
+    // Report the actual granted size for the first socket so callers can
+    // detect kernel capping via net.core.{r,w}mem_max.
+    for (int to = 0; to < total_parties_; ++to) {
+      if (to == pid_) continue;
+      emp::NetIO* io = send_ios_[static_cast<size_t>(to)];
+      if (io == nullptr || io->consocket < 0) continue;
+      int actual_sndbuf = 0;
+      socklen_t len = sizeof(actual_sndbuf);
+      getsockopt(io->consocket, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
+      std::fprintf(stderr,
+          "[NetNP P%d] Requested SO_SNDBUF=%d, kernel granted=%d "
+          "(if smaller than requested, raise net.core.wmem_max/rmem_max).\n",
+          pid_, buffer_size, actual_sndbuf);
+      break;
+    }
   }
 
  private:

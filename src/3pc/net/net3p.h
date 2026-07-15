@@ -191,46 +191,50 @@ class Net3P {
    * Future NetNP: implement the same method signature — bench::increaseSocketBuffers()
    * in utils.h will pick it up automatically via the template.
    */
+  /**
+   * Set SO_SNDBUF and SO_RCVBUF on every socket owned by this party to
+   * `buffer_size` bytes. emp::NetIO exposes the underlying fd via its
+   * public `consocket` member, so this sets the option directly.
+   *
+   * The kernel may cap the value at net.core.{r,w}mem_max (and doubles
+   * whatever it grants for bookkeeping overhead); if large sends/recvs
+   * still stall under high-latency/bandwidth-limited networks, raise
+   * those sysctls too, e.g.:
+   *   sudo sysctl -w net.core.rmem_max=<bytes> net.core.wmem_max=<bytes>
+   *
+   * Call immediately after construction, before any data is exchanged.
+   */
   void increaseSocketBuffers(int buffer_size) {
-    // All four sockets this party owns (two outgoing, two incoming).
-    emp::NetIO* sockets[4] = {
-        send_to_nxt_, send_to_prv_,
-        recv_from_nxt_, recv_from_prv_,
+    auto set_buf = [&](emp::NetIO* io, const char* label) {
+      if (io == nullptr || io->consocket < 0) return;
+      const int fd = io->consocket;
+      if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+        std::fprintf(stderr,
+            "[Net3P P%d] setsockopt(SO_SNDBUF) on %s failed: %s\n",
+            pid_, label, std::strerror(errno));
+      }
+      if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size)) != 0) {
+        std::fprintf(stderr,
+            "[Net3P P%d] setsockopt(SO_RCVBUF) on %s failed: %s\n",
+            pid_, label, std::strerror(errno));
+      }
     };
 
-    bool first = true;
-    for (emp::NetIO* io : sockets) {
-      if (!io) continue;
-      int fd = io->sock;
-      if (fd < 0) continue;
+    set_buf(send_to_nxt_, "send_to_nxt");
+    set_buf(send_to_prv_, "send_to_prv");
+    set_buf(recv_from_nxt_, "recv_from_nxt");
+    set_buf(recv_from_prv_, "recv_from_prv");
 
-      int r1 = ::setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size));
-      int r2 = ::setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer_size, sizeof(buffer_size));
-
-      if (first) {
-        first = false;
-        if (r1 != 0 || r2 != 0)
-          std::fprintf(stderr,
-              "[Net3P P%d] Warning: setsockopt failed (errno %d: %s)\n",
-              pid_, errno, std::strerror(errno));
-
-        // Read back the actual kernel-allocated sizes (Linux doubles the value).
-        int actual_snd = 0, actual_rcv = 0;
-        socklen_t optlen = sizeof(int);
-        ::getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen);
-        ::getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen);
-
-        std::printf("[Net3P P%d] Socket buffers — requested: %d B | "
-                    "actual: SNDBUF=%d B  RCVBUF=%d B\n",
-                    pid_, buffer_size, actual_snd, actual_rcv);
-
-        if (actual_snd < buffer_size || actual_rcv < buffer_size) {
-          std::fprintf(stderr,
-              "[Net3P P%d] Warning: buffers capped by system limits. "
-              "Consider: --sysctl net.core.rmem_max=%d --sysctl net.core.wmem_max=%d\n",
-              pid_, buffer_size, buffer_size);
-        }
-      }
+    // Report the actual granted size so callers can detect kernel capping
+    // via net.core.{r,w}mem_max.
+    if (send_to_nxt_ != nullptr && send_to_nxt_->consocket >= 0) {
+      int actual_sndbuf = 0;
+      socklen_t len = sizeof(actual_sndbuf);
+      getsockopt(send_to_nxt_->consocket, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
+      std::fprintf(stderr,
+          "[Net3P P%d] Requested SO_SNDBUF=%d, kernel granted=%d "
+          "(if smaller than requested, raise net.core.wmem_max/rmem_max).\n",
+          pid_, buffer_size, actual_sndbuf);
     }
   }
 

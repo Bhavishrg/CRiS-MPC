@@ -227,9 +227,9 @@ class OnlineEvaluator {
   size_t amor_permshare_pos_{0};
   bool evaluation_initialized_{false};
 
-  static constexpr size_t kParallelInteractiveThreshold = 8192;
-  static constexpr size_t kParallelLocalGateThreshold = 8192;
-  static constexpr size_t kParallelPermThreshold = 8192;
+  static constexpr size_t kParallelInteractiveThreshold = 256;
+  static constexpr size_t kParallelLocalGateThreshold = 256;
+  static constexpr size_t kParallelPermThreshold = 256;
 
   int helper_pid() const { return num_compute_parties_; }
 
@@ -693,6 +693,26 @@ class OnlineEvaluator {
   }
 
 
+  // Apply perm to v[offset .. offset+perm.size()) and return result.
+  static std::vector<T> applyPermAt(const std::vector<size_t>& perm,
+                                    const std::vector<T>& v,
+                                    size_t offset) {
+    const size_t n = perm.size();
+    if (offset + n > v.size())
+      throw std::runtime_error("NPH OnlineEvaluator::applyPermAt: range out of bounds");
+    for (size_t i = 0; i < n; ++i) {
+      if (perm[i] >= n)
+        throw std::runtime_error("NPH OnlineEvaluator::applyPermAt: index out of range");
+    }
+    std::vector<T> out(n);
+    #pragma omp parallel for if(n >= kParallelPermThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      out[i] = v[offset + perm[i]];
+    }
+    return out;
+  }
+
   static std::vector<T> applyPerm(const std::vector<size_t>& perm,
                                   const std::vector<T>& v) {
     if (perm.size() != v.size()) {
@@ -1143,45 +1163,119 @@ class OnlineEvaluator {
       throw std::runtime_error("NPH OnlineEvaluator: not enough kPermSh preprocessing");
     }
 
+    // Validate all gates up front before touching any network state.
     for (size_t gi = 0; gi < G; ++gi) {
       const PermShGate& g = *gates[gi];
       const PermShGatePreproc<T>& pp = preproc_.permsh[permsh_pos_ + gi];
       const size_t n = g.ins.size();
-
-      if (n == 0 || g.outs.size() != n) {
+      if (n == 0 || g.outs.size() != n)
         throw std::runtime_error("NPH batchPermSh: malformed kPermSh gate");
-      }
       if (pp.target != g.target || pp.perm_group_id != g.perm_group_id ||
           pp.vec_size != n || pp.opening_mask_share.size() != n ||
-          pp.permuted_mask_share.size() != n) {
+          pp.permuted_mask_share.size() != n)
         throw std::runtime_error("NPH batchPermSh: preprocessing mismatch");
-      }
-      if (pid_ == g.target && (!pp.local_perm || pp.local_perm->size() != n)) {
+      if (pid_ == g.target && (!pp.local_perm || pp.local_perm->size() != n))
         throw std::runtime_error("NPH batchPermSh: target missing local permutation");
-      }
+    }
 
-      std::vector<T> masked(n);
-      #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
-      for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
-        const size_t j = static_cast<size_t>(jj);
-        masked[j] = wires_[g.ins[j]].value + pp.opening_mask_share[j];
-      }
+    // Group gate indices by target and compute per-target flat masked vectors.
+    //   1. Compute masked_t for every target t.
+    //   2. Send masked_t to each t != pid_ — all sends before any recv.
+    //   3. flush() — one system call drains all outgoing buffers at once.
+    //   4. Receive from all p != pid_ the data they sent for our own target group.
+    //   5. write wires.
 
-      std::vector<T> opened = reconstructTo(masked, g.target);
+    const size_t NP = static_cast<size_t>(num_compute_parties_);
 
-      if (pid_ == g.target) {
-        std::vector<T> permuted = applyPerm(*pp.local_perm, opened);
+    std::vector<std::vector<size_t>> by_target(NP);
+    for (size_t gi = 0; gi < G; ++gi) {
+      const int t = gates[gi]->target;
+      if (t < 0 || t >= num_compute_parties_)
+        throw std::runtime_error("NPH batchPermSh: invalid target party");
+      by_target[static_cast<size_t>(t)].push_back(gi);
+    }
+
+    // Build a flat masked buffer for each target group.
+    std::vector<std::vector<T>> masked_for_target(NP);
+    std::vector<size_t> group_total(NP, 0);
+    for (int target = 0; target < num_compute_parties_; ++target) {
+      const std::vector<size_t>& group = by_target[static_cast<size_t>(target)];
+      for (size_t gi : group)
+        group_total[static_cast<size_t>(target)] += gates[gi]->ins.size();
+
+      masked_for_target[static_cast<size_t>(target)].assign(
+          group_total[static_cast<size_t>(target)], T{});
+
+      size_t offset = 0;
+      for (size_t gi : group) {
+        const PermShGate& g = *gates[gi];
+        const PermShGatePreproc<T>& pp = preproc_.permsh[permsh_pos_ + gi];
+        const size_t n = g.ins.size();
+        const size_t base = offset;
         #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
         for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
           const size_t j = static_cast<size_t>(jj);
-          wires_[g.outs[j]] = AdditiveShare<T>(permuted[j] - pp.permuted_mask_share[j]);
+          masked_for_target[static_cast<size_t>(target)][base + j] =
+              wires_[g.ins[j]].value + pp.opening_mask_share[j];
         }
-      } else {
-        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
-        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+        offset += n;
+      }
+    }
+
+    // Phase 1: send our masked data to every other target (non-blocking sends,
+    // all issued before the single flush).
+    for (int target = 0; target < num_compute_parties_; ++target) {
+      if (target == pid_) continue;
+      const auto& buf = masked_for_target[static_cast<size_t>(target)];
+      if (!buf.empty())
+        net_.send_ring<T>(buf.data(), buf.size(), target);
+    }
+    net_.flush();
+
+    // Phase 2: receive from all other parties and accumulate into our own
+    // reconstruction buffer (the group where target == pid_).
+    const size_t my_total = group_total[static_cast<size_t>(pid_)];
+    std::vector<T> my_opened = masked_for_target[static_cast<size_t>(pid_)];
+    if (!by_target[static_cast<size_t>(pid_)].empty()) {
+      std::vector<T> recv_buf(my_total);
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p == pid_) continue;
+        net_.recv_ring<T>(recv_buf.data(), my_total, p);
+        #pragma omp parallel for if(my_total >= kParallelInteractiveThreshold) schedule(static)
+        for (long long jj = 0; jj < static_cast<long long>(my_total); ++jj) {
           const size_t j = static_cast<size_t>(jj);
-          wires_[g.outs[j]] = AdditiveShare<T>(T{} - pp.permuted_mask_share[j]);
+          my_opened[j] += recv_buf[j];
         }
+      }
+    }
+
+    // Phase 3: write output wires for every gate.
+    for (int target = 0; target < num_compute_parties_; ++target) {
+      const std::vector<size_t>& group = by_target[static_cast<size_t>(target)];
+      if (group.empty()) continue;
+
+      size_t offset = 0;
+      for (size_t gi : group) {
+        const PermShGate& g = *gates[gi];
+        const PermShGatePreproc<T>& pp = preproc_.permsh[permsh_pos_ + gi];
+        const size_t n = g.ins.size();
+        const size_t base = offset;
+
+        if (pid_ == target) {
+          std::vector<T> permuted = applyPermAt(*pp.local_perm, my_opened, base);
+          #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            wires_[g.outs[j]] = AdditiveShare<T>(permuted[j] - pp.permuted_mask_share[j]);
+          }
+        } else {
+          #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
+          for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
+            const size_t j = static_cast<size_t>(jj);
+            wires_[g.outs[j]] = AdditiveShare<T>(T{} - pp.permuted_mask_share[j]);
+          }
+        }
+        offset += n;
       }
     }
 
@@ -1262,13 +1356,7 @@ class OnlineEvaluator {
 
       std::vector<T> my_permuted;
       if (pid_ >= 0 && pid_ < num_compute_parties_) {
-        std::vector<T> opened_slice(n);
-        #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
-        for (long long jj = 0; jj < static_cast<long long>(n); ++jj) {
-          const size_t j = static_cast<size_t>(jj);
-          opened_slice[j] = opened[base + j];
-        }
-        my_permuted = applyPerm(*pp.local_perm, opened_slice);
+        my_permuted = applyPermAt(*pp.local_perm, opened, base);
       }
 
       for (int target = 0; target < num_compute_parties_; ++target) {
@@ -1431,26 +1519,61 @@ class OnlineEvaluator {
   }
 
   void batchRecP(const std::vector<std::vector<const FIn1Gate*>>& by_target) {
+    // Build per-target share vectors and compute totals.
+    const size_t NP = static_cast<size_t>(num_compute_parties_);
+    std::vector<std::vector<T>> shares_for_target(NP);
     for (int target = 0; target < num_compute_parties_; ++target) {
       const auto& gates = by_target[static_cast<size_t>(target)];
-      if (gates.empty()) continue;
-
       const size_t n = gates.size();
-      std::vector<T> shares(n);
+      shares_for_target[static_cast<size_t>(target)].resize(n);
       #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
       for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
         const size_t i = static_cast<size_t>(ii);
-        shares[i] = wires_[gates[i]->in].value;
+        shares_for_target[static_cast<size_t>(target)][i] = wires_[gates[i]->in].value;
       }
+    }
 
-      std::vector<T> plain = reconstructTo(shares, target);
+    // Phase 1: send our shares to every target != pid_ (all sends before recv).
+    for (int target = 0; target < num_compute_parties_; ++target) {
+      if (target == pid_) continue;
+      const auto& buf = shares_for_target[static_cast<size_t>(target)];
+      if (!buf.empty())
+        net_.send_ring<T>(buf.data(), buf.size(), target);
+    }
+    net_.flush();
 
-      // Same convention as the 3PC evaluator: the target gets plaintext,
-      // non-targets get zero.
+    // Phase 2: receive contributions from all non-target parties for our own
+    // target group and reconstruct.
+    const auto& my_gates = by_target[static_cast<size_t>(pid_)];
+    const size_t my_n = my_gates.size();
+    std::vector<T> my_plain = shares_for_target[static_cast<size_t>(pid_)];
+    if (my_n > 0) {
+      std::vector<T> recv_buf(my_n);
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p == pid_) continue;
+        net_.recv_ring<T>(recv_buf.data(), my_n, p);
+        #pragma omp parallel for if(my_n >= kParallelInteractiveThreshold) schedule(static)
+        for (long long ii = 0; ii < static_cast<long long>(my_n); ++ii) {
+          const size_t i = static_cast<size_t>(ii);
+          my_plain[i] += recv_buf[i];
+        }
+      }
+    }
+
+    // Write output wires: target gets plaintext, non-targets get zero.
+    for (int target = 0; target < num_compute_parties_; ++target) {
+      const auto& gates = by_target[static_cast<size_t>(target)];
+      const size_t n = gates.size();
+      if (n == 0) continue;
+
+      const bool is_target = (pid_ == target);
+      const std::vector<T>& plain =
+          is_target ? my_plain : shares_for_target[static_cast<size_t>(target)];
+
       #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
       for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
         const size_t i = static_cast<size_t>(ii);
-        wires_[gates[i]->out] = AdditiveShare<T>((pid_ == target) ? plain[i] : T{});
+        wires_[gates[i]->out] = AdditiveShare<T>(is_target ? plain[i] : T{});
       }
     }
   }

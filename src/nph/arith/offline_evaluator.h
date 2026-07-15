@@ -163,8 +163,8 @@ class OfflineEvaluator {
   PairwisePRG pairwise_prg_;
   bool disable_optimized_shuffle_{false};
 
-  static constexpr size_t kParallelPreprocThreshold = 8192;
-  static constexpr size_t kParallelPermThreshold = 8192;
+  static constexpr size_t kParallelPreprocThreshold = 256;
+  static constexpr size_t kParallelPermThreshold = 256;
 
   int helper_pid() const { return num_compute_parties_; }
   int last_compute_pid() const { return num_compute_parties_ - 1; }
