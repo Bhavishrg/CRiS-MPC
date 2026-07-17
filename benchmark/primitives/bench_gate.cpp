@@ -1,4 +1,4 @@
-// benchmark/bench_gate.cpp
+// benchmark/primitives/bench_gate.cpp
 //
 // Protocol-flexible single-gate benchmark for CRiS-MPC.
 //

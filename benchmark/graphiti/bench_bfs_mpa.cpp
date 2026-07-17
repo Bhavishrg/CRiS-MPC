@@ -1,24 +1,23 @@
-// graphiti/bench_pagerank_mpa.cpp
+// benchmark/graphiti/bench_bfs_mpa.cpp
 //
-// Benchmark for Graphiti-style PageRank message passing.
+// Benchmark for Graphiti message-passing for BFS/contact tracing.
 //
 // The setup part masks the order-transition permutations by grouped shuffle and
 // reconstructs only the shuffled labels.  Those setup levels are evaluated
 // before the measured online phase and are not included in measured totals.
 //
 // Usage:
-//   ./run.sh bench_pagerank_mpa --protocol nph --num-parties 2 --graph-size 10000 --num-iters 10
-//   ./run.sh bench_pagerank_mpa --protocol nph --num-parties 2 --graph-size 10000 --num-iters 10 --disable-optimized-shuffle
-//   ./run.sh bench_pagerank_mpa --protocol rss3 --num-parties 3 --graph-size 10000 --num-iters 10
+//   ./run.sh bench_bfs_mpa --protocol nph --num-parties 2 --graph-size 10000 --num-hops 10
+//   ./run.sh bench_bfs_mpa --protocol nph --num-parties 2 --graph-size 10000 --num-hops 10 --disable-optimized-shuffle
+//   ./run.sh bench_bfs_mpa --protocol rss3 --num-parties 3 --graph-size 10000 --num-hops 10 --skip-final-applyv
 //
-// If --graph-size N is provided, V=N/10 and E=N-V.  This benchmark uses
-// alpha=1 and secret-shared rho=1.  Use --num-verts V and --num-edges E
-// instead when the vertex/edge split should be explicit.
+// If --graph-size N is provided, V=N/10 and E=N-V.  Use --num-verts V and
+// --num-edges E instead when the vertex/edge split should be explicit.
 
 #include "src/common/circuit/circuit.h"
 #include "src/common/protocol_runner.h"
 #include "benchmark/utils.h"
-#include "graphiti/graphutils.h"
+#include "benchmark/graphiti/graphutils.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -42,8 +41,7 @@ struct CircuitData {
     std::vector<wire_t> src_in;
     std::vector<wire_t> dst_in;
     std::vector<wire_t> isv_in;
-    std::vector<wire_t> pr_in;
-    std::vector<wire_t> rho_in;
+    std::vector<wire_t> datas_in;
     std::vector<wire_t> vertex_to_source_perm_in;
     std::vector<wire_t> source_to_destination_perm_in;
     std::vector<wire_t> destination_to_vertex_perm_in;
@@ -53,12 +51,11 @@ struct PlainInputs {
     std::vector<T> src;
     std::vector<T> dst;
     std::vector<T> isv;
-    std::vector<T> pr;
-    std::vector<T> rho;
+    std::vector<T> datas;
     std::vector<T> vertex_to_source_perm;
     std::vector<T> source_to_destination_perm;
     std::vector<T> destination_to_vertex_perm;
-    std::vector<T> expected_pr;
+    std::vector<T> expected_reachable;
     bool has_expected = false;
 };
 
@@ -136,13 +133,14 @@ static std::vector<wire_t> addZeroAnchor(Circuit<T>& c,
 
 static CircuitData generateCircuit(size_t num_vertices,
                                    size_t num_edges,
-                                   int num_iters) {
+                                   int num_hops,
+                                   bool final_applyv) {
     const size_t n = num_vertices + num_edges;
     if (n == 0 || num_vertices == 0 || num_vertices > n) {
         throw std::invalid_argument("generateCircuit: invalid graph dimensions");
     }
-    if (num_iters <= 0) {
-        throw std::invalid_argument("generateCircuit: num_iters must be positive");
+    if (num_hops <= 0) {
+        throw std::invalid_argument("generateCircuit: num_hops must be positive");
     }
 
     Circuit<T> c;
@@ -151,8 +149,7 @@ static CircuitData generateCircuit(size_t num_vertices,
     cd.src_in = makeInputVector(c, n, P1);
     cd.dst_in = makeInputVector(c, n, P1);
     cd.isv_in = makeInputVector(c, n, P1);
-    cd.pr_in = makeInputVector(c, n, P1);
-    cd.rho_in = makeInputVector(c, n, P1);
+    cd.datas_in = makeInputVector(c, n, P1);
     cd.vertex_to_source_perm_in = makeInputVector(c, n, P1);
     cd.source_to_destination_perm_in = makeInputVector(c, n, P1);
     cd.destination_to_vertex_perm_in = makeInputVector(c, n, P1);
@@ -179,17 +176,17 @@ static CircuitData generateCircuit(size_t num_vertices,
         {public_destination_to_vertex.front(), public_destination_to_vertex.back() + 1}
     };
 
-    // Make the PageRank data path depend on the opened setup permutation labels.
+    // Make the BFS data path depend on the opened setup permutation labels.
     // This keeps setup shuffles/reconstructions in earlier levels so the
     // benchmark can evaluate them before resetting online counters.
-    std::vector<wire_t> pr =
-        addZeroAnchor(c, cd.pr_in, public_vertex_to_source[0]);
+    std::vector<wire_t> datas =
+        addZeroAnchor(c, cd.datas_in, public_vertex_to_source[0]);
 
-    wire_t zero = c.addGate(GateType::kSub, pr[0], pr[0]);
+    wire_t zero = c.addGate(GateType::kSub, datas[0], datas[0]);
 
-    for (int iter = 0; iter < num_iters; ++iter) {
+    for (int hop = 0; hop < num_hops; ++hop) {
         std::vector<wire_t> datar_source =
-            c.addSubCircPropagate(pr,
+            c.addSubCircPropagate(datas,
                                   public_vertex_to_source,
                                   num_vertices,
                                   gid_vertex_to_source,
@@ -208,20 +205,20 @@ static CircuitData generateCircuit(size_t num_vertices,
                                num_vertices,
                                gid_destination_to_vertex);
 
-        std::vector<wire_t> next_pr(n, zero);
+        std::vector<wire_t> next_datas(n, zero);
         for (size_t i = 0; i < num_vertices; ++i) {
-            if (iter + 1 == num_iters) {
-                next_pr[i] = datag_vertex[i];
-            } else {
-                next_pr[i] =
-                    c.addGate(GateType::kMul, cd.rho_in[i], datag_vertex[i]);
-            }
+            next_datas[i] = c.addGate(GateType::kAdd, datas[i], datag_vertex[i]);
         }
-        pr = std::move(next_pr);
+        datas = std::move(next_datas);
     }
 
     for (size_t i = 0; i < num_vertices; ++i) {
-        c.setAsOutput(pr[i]);
+        wire_t out = datas[i];
+        if (final_applyv) {
+            wire_t is_zero = c.addEqzGate(datas[i]);
+            out = c.addCGate(GateType::kCSub, is_zero, T{1}, true);
+        }
+        c.setAsOutput(out);
     }
 
     cd.lc = c.orderGatesByLevel();
@@ -229,34 +226,42 @@ static CircuitData generateCircuit(size_t num_vertices,
     return cd;
 }
 
-static std::vector<T> expectedPageRank(const graphiti::GraphList& graph,
-                                       size_t num_vertices,
-                                       int num_iters) {
-    std::vector<T> pr(num_vertices, T{1});
+static std::vector<T> expectedReachability(const graphiti::GraphList& graph,
+                                           size_t num_vertices,
+                                           int num_hops,
+                                           size_t source_vertex) {
+    std::vector<T> reached(num_vertices, T{0});
+    reached[source_vertex] = T{1};
 
-    for (int iter = 0; iter < num_iters; ++iter) {
-        std::vector<T> next(num_vertices, T{0});
+    for (int hop = 0; hop < num_hops; ++hop) {
+        std::vector<T> next = reached;
         for (size_t i = 0; i < graph.size(); ++i) {
             if (graph.isV[i] != 0) {
                 continue;
             }
             const size_t src = static_cast<size_t>(graph.src[i]);
             const size_t dst = static_cast<size_t>(graph.dst[i]);
-            if (src < num_vertices && dst < num_vertices) {
-                next[dst] += pr[src];
+            if (src < num_vertices && dst < num_vertices && reached[src] != T{0}) {
+                next[dst] = T{1};
             }
         }
-        pr = std::move(next);
+        reached = std::move(next);
     }
 
-    return pr;
+    return reached;
 }
 
 static PlainInputs makePlainInputs(size_t num_vertices,
                                    size_t num_edges,
-                                   int num_iters,
+                                   int num_hops,
+                                   size_t source_vertex,
                                    uint64_t seed,
+                                   bool final_applyv,
                                    bool make_expected) {
+    if (source_vertex >= num_vertices) {
+        throw std::invalid_argument("source vertex must be in [0, num_vertices)");
+    }
+
     graphiti::RandomGraphConfig cfg;
     cfg.num_vertices = num_vertices;
     cfg.num_edges = num_edges;
@@ -272,16 +277,13 @@ static PlainInputs makePlainInputs(size_t num_vertices,
     in.src.resize(graph.size());
     in.dst.resize(graph.size());
     in.isv.resize(graph.size());
-    in.pr.assign(graph.size(), T{0});
-    in.rho.assign(graph.size(), T{1});
+    in.datas.assign(graph.size(), T{0});
+    in.datas[source_vertex] = T{1};
 
     for (size_t i = 0; i < graph.size(); ++i) {
         in.src[i] = static_cast<T>(graph.src[i]);
         in.dst[i] = static_cast<T>(graph.dst[i]);
         in.isv[i] = static_cast<T>(graph.isV[i]);
-    }
-    for (size_t i = 0; i < num_vertices; ++i) {
-        in.pr[i] = T{1};
     }
 
     in.vertex_to_source_perm =
@@ -291,9 +293,9 @@ static PlainInputs makePlainInputs(size_t num_vertices,
     in.destination_to_vertex_perm =
         destinationLabelsFromPull(order.destination_to_vertex);
 
-    if (make_expected) {
-        in.expected_pr =
-            expectedPageRank(graph, num_vertices, num_iters);
+    if (make_expected && final_applyv) {
+        in.expected_reachable =
+            expectedReachability(graph, num_vertices, num_hops, source_vertex);
         in.has_expected = true;
     }
 
@@ -312,8 +314,10 @@ struct Args {
     size_t graph_size = 0;
     size_t num_vertices = 0;
     size_t num_edges = 0;
-    int num_iters = 10;
-    uint64_t seed = 0x5041474552414e4bULL;
+    int num_hops = 10;
+    size_t source_vertex = 0;
+    uint64_t seed = 0x4752415048495449ULL;
+    bool final_applyv = true;
     bool check = true;
 
     int port = 14800;
@@ -325,11 +329,10 @@ static void printUsage(const char* prog) {
     std::fprintf(stderr,
         "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
         "(--graph-size <N> | --num-verts <V> --num-edges <E>) "
-        "[--num-iters <r>] [--seed <s>] [--pking] "
+        "[--num-hops <h>] [--source-vertex <v>] [--seed <s>] [--pking] "
         "[--port <p>] [--peer <addr>] [--output <file>] "
-        "[--disable-optimized-shuffle] [--no-check]\n\n"
+        "[--disable-optimized-shuffle] [--skip-final-applyv] [--no-check]\n\n"
         "If --graph-size N is provided, V=N/10 and E=N-V.\n"
-        "This benchmark uses alpha=1 and secret-shared rho=1.\n"
         "NPH uses pids 0..num-parties, with helper pid num-parties.\n",
         prog);
 }
@@ -351,8 +354,10 @@ static Args parseArgs(int argc, char* argv[]) {
             a.num_vertices = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--num-edges") == 0 && i + 1 < argc) {
             a.num_edges = static_cast<size_t>(std::atoll(argv[++i]));
-        } else if (std::strcmp(argv[i], "--num-iters") == 0 && i + 1 < argc) {
-            a.num_iters = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--num-hops") == 0 && i + 1 < argc) {
+            a.num_hops = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--source-vertex") == 0 && i + 1 < argc) {
+            a.source_vertex = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             a.seed = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -365,6 +370,8 @@ static Args parseArgs(int argc, char* argv[]) {
             a.pking = true;
         } else if (std::strcmp(argv[i], "--disable-optimized-shuffle") == 0) {
             a.disable_optimized_shuffle = true;
+        } else if (std::strcmp(argv[i], "--skip-final-applyv") == 0) {
+            a.final_applyv = false;
         } else if (std::strcmp(argv[i], "--no-check") == 0) {
             a.check = false;
         } else {
@@ -392,9 +399,15 @@ static Args parseArgs(int argc, char* argv[]) {
         a.graph_size == 0 ||
         a.num_vertices == 0 ||
         a.num_vertices + a.num_edges != a.graph_size ||
-        a.num_iters <= 0) {
+        a.source_vertex >= a.num_vertices ||
+        a.num_hops <= 0) {
         printUsage(argv[0]);
         std::exit(1);
+    }
+
+    if (a.protocol == protocol::ProtocolKind::Rss3 && a.final_applyv) {
+        throw std::invalid_argument(
+            "bench_bfs_mpa: RSS3 does not support kEqz; use --skip-final-applyv");
     }
 
     return a;
@@ -439,7 +452,7 @@ static void benchmark(const Args& args) {
     const bool is_helper =
         args.protocol == protocol::ProtocolKind::Nph && pid == args.num_parties;
 
-    std::printf("\n=== bench_pagerank_mpa ===\n");
+    std::printf("\n=== bench_bfs_mpa ===\n");
     std::printf("  protocol      : %s\n", protocol::protocolName(args.protocol));
     std::printf("  num_parties   : %d%s\n",
                 args.num_parties,
@@ -453,9 +466,9 @@ static void benchmark(const Args& args) {
     std::printf("  graph_size    : %zu\n", args.graph_size);
     std::printf("  num_vertices  : %zu\n", args.num_vertices);
     std::printf("  num_edges     : %zu\n", args.num_edges);
-    std::printf("  num_iters     : %d\n", args.num_iters);
-    std::printf("  alpha         : 1\n");
-    std::printf("  rho           : 1 (secret-shared)\n");
+    std::printf("  num_hops      : %d\n", args.num_hops);
+    std::printf("  source_vertex : %zu\n", args.source_vertex);
+    std::printf("  final_applyv  : %s\n", args.final_applyv ? "true" : "false");
     std::printf("  seed          : %" PRIu64 "\n", args.seed);
     std::printf("  port          : %d\n", args.port);
     std::printf("  peer          : %s\n\n", args.peer.c_str());
@@ -463,7 +476,8 @@ static void benchmark(const Args& args) {
     std::printf("[P%d] Building circuit...\n", pid);
     CircuitData cd = generateCircuit(args.num_vertices,
                                      args.num_edges,
-                                     args.num_iters);
+                                     args.num_hops,
+                                     args.final_applyv);
     const LevelOrderedCircuit& lc = cd.lc;
 
     std::printf("[P%d] Circuit: %zu gates, %zu wires, depth %zu\n\n",
@@ -477,13 +491,15 @@ static void benchmark(const Args& args) {
         std::printf("[P%d] Generating graph and permutations...\n", pid);
         plain = makePlainInputs(args.num_vertices,
                                 args.num_edges,
-                                args.num_iters,
+                                args.num_hops,
+                                args.source_vertex,
                                 args.seed,
+                                args.final_applyv,
                                 make_expected);
         std::printf("[P%d] Graph rows: %zu, graph storage about %zu bytes\n\n",
                     pid,
-                    plain.pr.size(),
-                    plain.pr.size() *
+                    plain.datas.size(),
+                    plain.datas.size() *
                         (3 * sizeof(graphiti::GraphValue) + sizeof(std::uint8_t)));
     }
 
@@ -506,8 +522,7 @@ static void benchmark(const Args& args) {
         runner->setInputs(cd.src_in, plain.src);
         runner->setInputs(cd.dst_in, plain.dst);
         runner->setInputs(cd.isv_in, plain.isv);
-        runner->setInputs(cd.pr_in, plain.pr);
-        runner->setInputs(cd.rho_in, plain.rho);
+        runner->setInputs(cd.datas_in, plain.datas);
         runner->setInputs(cd.vertex_to_source_perm_in, plain.vertex_to_source_perm);
         runner->setInputs(cd.source_to_destination_perm_in,
                           plain.source_to_destination_perm);
@@ -545,18 +560,18 @@ static void benchmark(const Args& args) {
     bool checked = false;
     if (owner_generates && plain.has_expected && !runner->isHelper()) {
         checked = true;
-        ok = sameVector(out, plain.expected_pr);
+        ok = sameVector(out, plain.expected_reachable);
     }
 
-    std::printf("[P%d] PageRank correctness: %s%s\n",
+    std::printf("[P%d] BFS correctness: %s%s\n",
                 pid,
                 checked ? (ok ? "PASS" : "FAIL") : "SKIP",
-                checked ? "" : " (large graph or helper)");
+                checked ? "" : " (large graph, helper, or raw-count output)");
 
     if (!runner->isHelper() && (args.graph_size <= 40 || (checked && !ok))) {
         printVector("output", pid, out);
         if (plain.has_expected) {
-            printVector("expected", pid, plain.expected_pr);
+            printVector("expected", pid, plain.expected_reachable);
         }
     }
 
@@ -567,7 +582,7 @@ static void benchmark(const Args& args) {
 
     nlohmann::json output_doc;
     output_doc["details"] = {
-        {"benchmark", "bench_pagerank_mpa"},
+        {"benchmark", "bench_bfs_mpa"},
         {"protocol", protocol::protocolName(args.protocol)},
         {"num_compute_parties", args.num_parties},
         {"pking", args.pking},
@@ -577,10 +592,10 @@ static void benchmark(const Args& args) {
         {"graph_size", args.graph_size},
         {"num_vertices", args.num_vertices},
         {"num_edges", args.num_edges},
-        {"num_iters", args.num_iters},
-        {"alpha", 1},
-        {"rho", 1},
+        {"num_hops", args.num_hops},
+        {"source_vertex", args.source_vertex},
         {"seed", args.seed},
+        {"final_applyv", args.final_applyv},
         {"setup_end_level", cd.setup_end_level},
         {"measured_start_level", cd.setup_end_level + 1},
         {"port", args.port},

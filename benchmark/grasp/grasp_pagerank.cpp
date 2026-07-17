@@ -1,4 +1,4 @@
-// grasp/bench_dcc_pagerank_mpa.cpp
+// benchmark/grasp/grasp_pagerank.cpp
 //
 // NPH benchmark for DCC/GraSP-style PageRank message passing.
 //
@@ -12,8 +12,8 @@
 // measured separately from both offline preprocessing and online PageRank.
 
 #include "benchmark/utils.h"
-#include "graphiti/graphutils.h"
-#include "grasp/graphutils.h"
+#include "benchmark/graphiti/graphutils.h"
+#include "benchmark/grasp/graphutils.h"
 #include "src/common/circuit/circuit.h"
 #include "src/common/types.h"
 #include "src/nph/arith/offline_evaluator.h"

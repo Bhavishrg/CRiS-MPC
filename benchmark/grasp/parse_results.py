@@ -2,7 +2,8 @@
 """Parse and summarize bench_dcc_pagerank_mpa sweep results.
 
 This module reads summary files created by run.sh under:
-benchmark/Results/bench_dcc_pagerank_mpa/protocol_nph/parties_<n>/verts_<V>/edges_<E>/<timestamp>/summary.txt
+benchmark/grasp/Results/comparison_ringsg/bench_dcc_pagerank_mpa/
+protocol_nph/parties_<n>/verts_<V>/edges_<E>/<timestamp>/summary.txt
 
 Graph shape is specified explicitly via num_vertices/num_edges (rather than
 a single --graph-size), typically derived from a "size" using fixed
@@ -50,6 +51,8 @@ class RunAggregate:
 def auto_detect_results_root(repo_root: Path) -> Path:
     """Pick the most populated known results root for this benchmark."""
     candidates = [
+        repo_root / "benchmark" / "grasp" / "Results" /
+        "comparison_ringsg" / "bench_dcc_pagerank_mpa" / "protocol_nph",
         repo_root / "Results" / "bench_dcc_pagerank_mpa" / "protocol_nph",
         repo_root / "benchmark" / "Results" / "bench_dcc_pagerank_mpa" / "protocol_nph",
     ]
@@ -333,7 +336,7 @@ def main() -> None:
     parser.add_argument("--edge-mult", type=int, default=15, help="num_edges = size * edge-mult")
     parser.add_argument(
         "--out-dir",
-        default="grasp/results_tables",
+        default="benchmark/grasp/Results/Tables",
         help="Directory for generated CSV/MD/PNG tables",
     )
     parser.add_argument(

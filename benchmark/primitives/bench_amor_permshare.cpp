@@ -1,4 +1,4 @@
-// benchmark/bench_amor_permshare.cpp
+// benchmark/primitives/bench_amor_permshare.cpp
 //
 // NPH benchmark and correctness test for kAmorPermShare.
 //

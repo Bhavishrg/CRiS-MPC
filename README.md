@@ -40,12 +40,26 @@ CRiS-MPC/
 │       ├── protocol_runner.h
 │       └── types.h
 ├── benchmark/
-│   ├── bench_gate.cpp
-│   ├── bench_linear.cpp
-│   ├── bench_mult.cpp
-│   ├── bench_propagate.cpp
-│   ├── bench_sort.cpp
-│   ├── bench_unshuffle.cpp
+│   ├── primitives/
+│   │   ├── bench_amor_permshare.cpp
+│   │   ├── bench_gate.cpp
+│   │   ├── bench_linear.cpp
+│   │   ├── bench_mult.cpp
+│   │   ├── bench_permsh.cpp
+│   │   ├── bench_propagate.cpp
+│   │   ├── bench_sort.cpp
+│   │   └── bench_unshuffle.cpp
+│   ├── graphiti/
+│   │   ├── bench_bfs_mpa.cpp
+│   │   ├── bench_pagerank_mpa.cpp
+│   │   ├── bench_repeat_shuffle.cpp
+│   │   └── graphutils.h
+│   ├── grasp/
+│   │   ├── grasp_pagerank.cpp
+│   │   ├── eval.py
+│   │   ├── parse_results.py
+│   │   ├── Results/
+│   │   └── graphutils.h
 │   ├── utils.cpp
 │   ├── utils.h
 │   └── CMakeLists.txt
@@ -88,6 +102,15 @@ build/benchmark/
 ## Running Benchmarks
 
 The repository includes a helper script `run.sh` that launches the three parties locally and saves their outputs.
+
+Run the GraSP RingSG comparison sweeps with:
+
+```bash
+python3 benchmark/grasp/eval.py --comparison-ringsg
+```
+
+Raw logs are written below `benchmark/grasp/Results/comparison_ringsg/`, and
+the generated comparison tables are written to `benchmark/grasp/Results/Tables/`.
 
 Example:
 
@@ -150,7 +173,7 @@ To add a new benchmark, create a file in the `benchmark/` directory.
 For example:
 
 ```text
-benchmark/bench_gather.cpp
+benchmark/primitives/bench_gather.cpp
 ```
 
 Then add it to `benchmark/CMakeLists.txt`:

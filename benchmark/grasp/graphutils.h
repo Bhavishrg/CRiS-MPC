@@ -1,6 +1,6 @@
 #pragma once
 
-#include "graphiti/graphutils.h"
+#include "benchmark/graphiti/graphutils.h"
 
 #include <algorithm>
 #include <cstddef>

@@ -1,4 +1,4 @@
-// benchmark/bench_permsh.cpp
+// benchmark/primitives/bench_permsh.cpp
 //
 // NPH benchmark and correctness test for kPermSh.
 //
