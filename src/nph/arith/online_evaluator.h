@@ -105,6 +105,7 @@ class OnlineEvaluator {
         static_cast<size_t>(num_compute_parties_));
     std::vector<const FIn2Gate*> mul_gates;
     std::vector<const FIn1Gate*> eqz_gates;
+    std::vector<const FIn1Gate*> ltz_gates;
 
     // Keep permutation gates in consecutive same-kind runs.
     // Preprocessing is consumed in this exact order, while still allowing
@@ -138,6 +139,9 @@ class OnlineEvaluator {
         case GateType::kEqz:
           eqz_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
           break;
+        case GateType::kLtz:
+          ltz_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
+          break;
         case GateType::kShuffle:
         case GateType::kUnshuffle:
         case GateType::kPermSh:
@@ -154,6 +158,7 @@ class OnlineEvaluator {
     batchRecP(recp_by_target);
     batchMul(mul_gates);
     batchEqz(eqz_gates);
+    batchLtz(ltz_gates);
 
     for (const auto& run : permutation_runs) {
       if (run.first == GateType::kShuffle) {
@@ -222,6 +227,8 @@ class OnlineEvaluator {
   std::unordered_map<wire_t, T> inputs_;
   size_t triple_pos_{0};
   size_t eqz_pos_{0};
+  size_t boolean_triple_pos_{0};
+  size_t ltz_pos_{0};
   size_t shuffle_pos_{0};
   size_t permsh_pos_{0};
   size_t amor_permshare_pos_{0};
@@ -240,6 +247,8 @@ class OnlineEvaluator {
     public_value_known_.assign(lc.num_wires, 0);
     triple_pos_ = 0;
     eqz_pos_ = 0;
+    boolean_triple_pos_ = 0;
+    ltz_pos_ = 0;
     shuffle_pos_ = 0;
     permsh_pos_ = 0;
     amor_permshare_pos_ = 0;
@@ -252,6 +261,13 @@ class OnlineEvaluator {
     }
     if (eqz_pos_ != preproc_.eqz.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused kEqz preprocessing after evaluation");
+    }
+    if (boolean_triple_pos_ != preproc_.boolean_triples.size()) {
+      throw std::runtime_error(
+          "NPH OnlineEvaluator: unused Boolean triples after evaluation");
+    }
+    if (ltz_pos_ != preproc_.ltz.size()) {
+      throw std::runtime_error("NPH OnlineEvaluator: unused kLtz preprocessing after evaluation");
     }
     if (shuffle_pos_ != preproc_.shuffles.size()) {
       throw std::runtime_error("NPH OnlineEvaluator: unused shuffle preprocessing after evaluation");
@@ -306,6 +322,7 @@ class OnlineEvaluator {
           case GateType::kCMul:
           case GateType::kMul:
           case GateType::kEqz:
+          case GateType::kLtz:
           case GateType::kRec:
           case GateType::kShuffle:
           case GateType::kLocalPerm:
@@ -1448,6 +1465,231 @@ class OnlineEvaluator {
     }
 
     eqz_pos_ += n;
+  }
+
+  // Reconstruct arithmetic shares only to P0.  Other parties return zeros and
+  // do not receive the plaintext.  This is used to reveal x+r, where uniform r
+  // statistically hides x.
+  std::vector<T> reconstructArithmeticToP0(const std::vector<T>& my_shares) {
+    const size_t n = my_shares.size();
+    std::vector<T> result(n, T{});
+    if (n == 0) return result;
+
+    if (pid_ == 0) {
+      result = my_shares;
+      std::vector<T> buf(n);
+      for (int p = 1; p < num_compute_parties_; ++p) {
+        net_.recv_ring<T>(buf.data(), n, p);
+        for (size_t i = 0; i < n; ++i) result[i] += buf[i];
+      }
+    } else {
+      net_.send_ring<T>(my_shares.data(), n, 0);
+      net_.flush(0);
+    }
+    return result;
+  }
+
+  // Open XOR shares to all compute parties.  The communication pattern mirrors
+  // arithmetic reconstruction, replacing ring addition with XOR.
+  std::vector<uint8_t> reconstructBoolean(
+      const std::vector<uint8_t>& my_shares) {
+    const size_t n = my_shares.size();
+    std::vector<uint8_t> result(n, 0);
+    if (n == 0) return result;
+
+    if (!pking_) {
+      result = my_shares;
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p != pid_) net_.send_ring<uint8_t>(my_shares.data(), n, p);
+      }
+      net_.flush();
+      std::vector<uint8_t> buf(n);
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        if (p == pid_) continue;
+        net_.recv_ring<uint8_t>(buf.data(), n, p);
+        for (size_t i = 0; i < n; ++i) result[i] ^= buf[i];
+      }
+    } else if (pid_ == 0) {
+      result = my_shares;
+      std::vector<uint8_t> buf(n);
+      for (int p = 1; p < num_compute_parties_; ++p) {
+        net_.recv_ring<uint8_t>(buf.data(), n, p);
+        for (size_t i = 0; i < n; ++i) result[i] ^= buf[i];
+      }
+      for (int p = 1; p < num_compute_parties_; ++p)
+        net_.send_ring<uint8_t>(result.data(), n, p);
+      net_.flush();
+    } else {
+      net_.send_ring<uint8_t>(my_shares.data(), n, 0);
+      net_.flush(0);
+      net_.recv_ring<uint8_t>(result.data(), n, 0);
+    }
+
+    for (uint8_t& bit : result) bit &= 1U;
+    return result;
+  }
+
+  // Batched XOR-shared multiplication over GF(2), using helper-generated
+  // Boolean Beaver triples.  Opening d=x^a and e=y^b costs one round.
+  std::vector<uint8_t> booleanAnd(const std::vector<uint8_t>& xs,
+                                  const std::vector<uint8_t>& ys) {
+    if (xs.size() != ys.size())
+      throw std::invalid_argument("NPH booleanAnd: mismatched input sizes");
+    const size_t n = xs.size();
+    if (n == 0) return {};
+    if (boolean_triple_pos_ + n > preproc_.boolean_triples.size()) {
+      throw std::runtime_error("NPH booleanAnd: not enough Boolean triples");
+    }
+
+    std::vector<uint8_t> de_shares(2 * n);
+    for (size_t i = 0; i < n; ++i) {
+      const auto& triple = preproc_.boolean_triples[boolean_triple_pos_ + i];
+      de_shares[2 * i] = static_cast<uint8_t>((xs[i] ^ triple.a) & 1U);
+      de_shares[2 * i + 1] = static_cast<uint8_t>((ys[i] ^ triple.b) & 1U);
+    }
+    const auto de = reconstructBoolean(de_shares);
+
+    std::vector<uint8_t> result(n);
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t d = de[2 * i];
+      const uint8_t e = de[2 * i + 1];
+      const auto& triple = preproc_.boolean_triples[boolean_triple_pos_ + i];
+      uint8_t z = static_cast<uint8_t>(
+          triple.c ^ (d & triple.b) ^ (e & triple.a));
+      if (pid_ == 0) z ^= static_cast<uint8_t>(d & e);
+      result[i] = static_cast<uint8_t>(z & 1U);
+    }
+    boolean_triple_pos_ += n;
+    return result;
+  }
+
+  // ── Batch: kLtz — masked MSB-only Boolean subtraction ───────────────────
+  //
+  // Preprocessing supplies arithmetic [r], Boolean shares of every bit of r,
+  // and a daBit ([u]_B,[u]_A).  Parties open a=x+r only to P0.  P0 lazily
+  // Boolean-shares each clear bit of a as (a_i,0,...,0), then the parties run
+  // an optimized prefix subtraction for a-r=a+~r+1.
+  //
+  // For each bit: p_i=a_i XOR ~r_i and g_i=a_i AND ~r_i.  Prefix states over
+  // bits 0..k-2 combine as
+  //
+  //   G = G_high XOR (P_high AND G_low),
+  //   P = P_high AND P_low.
+  //
+  // With subtraction carry-in one, c_{k-1}=G XOR P, and the sign bit is
+  // z=p_{k-1} XOR c_{k-1}.  Finally v=z XOR u is opened; because u is random,
+  // v leaks nothing.  Arithmetic output shares are computed locally as
+  // [z]_A=[u]_A+v-2v[u]_A.
+  void batchLtz(const std::vector<const FIn1Gate*>& gates) {
+    if (gates.empty()) return;
+    const size_t n = gates.size();
+    const size_t bits = RingTraits<T>::bit_width;
+    if (ltz_pos_ + n > preproc_.ltz.size()) {
+      throw std::runtime_error("NPH batchLtz: not enough kLtz preprocessing");
+    }
+
+    std::vector<const LtzGatePreproc<T>*> pps(n, nullptr);
+    std::vector<T> masked_shares(n);
+    for (size_t i = 0; i < n; ++i) {
+      const auto& pp = preproc_.ltz[ltz_pos_ + i];
+      if (pp.r_bit_shares.size() != bits)
+        throw std::runtime_error("NPH batchLtz: preprocessing mismatch");
+      pps[i] = &pp;
+      masked_shares[i] = wires_[gates[i]->in].value + pp.r.value;
+    }
+    const auto opened_a = reconstructArithmeticToP0(masked_shares);
+
+    std::vector<std::vector<uint8_t>> propagate(n);
+    std::vector<uint8_t> gen_lhs, gen_rhs;
+    const size_t lower_bits = bits - 1;
+    gen_lhs.reserve(n * lower_bits);
+    gen_rhs.reserve(n * lower_bits);
+    for (size_t i = 0; i < n; ++i) {
+      propagate[i].resize(bits);
+      for (size_t bit = 0; bit < bits; ++bit) {
+        const uint8_t a_share =
+            pid_ == 0
+                ? static_cast<uint8_t>((opened_a[i] >> bit) & T{1})
+                : uint8_t{0};
+        const uint8_t not_r_share = static_cast<uint8_t>(
+            pps[i]->r_bit_shares[bit] ^ (pid_ == 0 ? 1U : 0U));
+        propagate[i][bit] =
+            static_cast<uint8_t>(a_share ^ not_r_share);
+        if (bit < lower_bits) {
+          gen_lhs.push_back(a_share);
+          gen_rhs.push_back(not_r_share);
+        }
+      }
+    }
+    const auto generates = booleanAnd(gen_lhs, gen_rhs);
+
+    struct PrefixState {
+      uint8_t generate{0};
+      uint8_t propagate{0};
+    };
+    std::vector<std::vector<PrefixState>> current(n);
+    size_t generate_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+      current[i].reserve(lower_bits);
+      for (size_t bit = 0; bit < lower_bits; ++bit)
+        current[i].push_back(
+            {generates[generate_idx++], propagate[i][bit]});
+    }
+
+    while (current[0].size() > 1) {
+      const size_t width = current[0].size();
+      std::vector<uint8_t> lhs, rhs;
+      lhs.reserve(n * (width / 2) * 2);
+      rhs.reserve(n * (width / 2) * 2);
+      for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          const auto& low = current[i][j];
+          const auto& high = current[i][j + 1];
+          lhs.push_back(high.propagate);
+          rhs.push_back(low.generate);
+          lhs.push_back(high.propagate);
+          rhs.push_back(low.propagate);
+        }
+      }
+      const auto products = booleanAnd(lhs, rhs);
+
+      size_t product_idx = 0;
+      std::vector<std::vector<PrefixState>> next(n);
+      for (size_t i = 0; i < n; ++i) {
+        next[i].reserve((width + 1) / 2);
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          const auto& high = current[i][j + 1];
+          const uint8_t propagated_generate = products[product_idx++];
+          const uint8_t combined_propagate = products[product_idx++];
+          next[i].push_back(
+              {static_cast<uint8_t>(high.generate ^ propagated_generate),
+               combined_propagate});
+        }
+        if (width & 1U) next[i].push_back(current[i].back());
+      }
+      current = std::move(next);
+    }
+
+    std::vector<uint8_t> masked_output_shares(n);
+    for (size_t i = 0; i < n; ++i) {
+      const uint8_t carry = static_cast<uint8_t>(
+          current[i][0].generate ^ current[i][0].propagate);
+      const uint8_t sign =
+          static_cast<uint8_t>(propagate[i][bits - 1] ^ carry);
+      masked_output_shares[i] =
+          static_cast<uint8_t>(sign ^ pps[i]->u_boolean_share);
+    }
+    const auto opened_v = reconstructBoolean(masked_output_shares);
+
+    for (size_t i = 0; i < n; ++i) {
+      const T v = static_cast<T>(opened_v[i]);
+      const T u_share = pps[i]->u_arithmetic_share.value;
+      T out = RingTraits<T>::sub(
+          u_share, RingTraits<T>::mul(static_cast<T>(2 * v), u_share));
+      if (pid_ == 0) out = RingTraits<T>::add(out, v);
+      wires_[gates[i]->out] = AdditiveShare<T>(out);
+    }
+    ltz_pos_ += n;
   }
 
   void batchMul(const std::vector<const FIn2Gate*>& gates) {

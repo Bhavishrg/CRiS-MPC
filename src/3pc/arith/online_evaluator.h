@@ -11,6 +11,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -177,6 +178,25 @@ class OnlineEvaluator {
   static constexpr size_t kParallelLocalPermThreshold = 8192;
   const std::vector<std::vector<gate_ptr_t>> empty_local_sublevels_{};
 
+  // Evaluate a*b modulo 2^k without allowing uint8_t/uint16_t operands to be
+  // promoted to signed int.  Such a promotion makes uint16_t multiplication
+  // undefined when the mathematical product exceeds INT_MAX.
+  static T ringMultiply(T a, T b) {
+    static_assert(std::is_integral_v<T> && std::is_unsigned_v<T>,
+                  "RSS3 arithmetic requires an unsigned integral ring type");
+    if constexpr (sizeof(T) < sizeof(unsigned int)) {
+      return static_cast<T>(static_cast<unsigned int>(a) *
+                            static_cast<unsigned int>(b));
+    } else {
+      return static_cast<T>(a * b);
+    }
+  }
+
+  struct BooleanRSSShare {
+    uint8_t left{0};
+    uint8_t right{0};
+  };
+
   // Permutation cache for grouped shuffle gates (perm_group_id ≥ 0).
   // Keyed by group id; value is {perm_12, perm_23, perm_31}.
   struct CachedPerms {
@@ -208,6 +228,8 @@ class OnlineEvaluator {
     std::vector<const FIn1Gate*> rec_gates;
     std::array<std::vector<const FIn1Gate*>, 3> recp_by_target{};
     std::vector<const FIn2Gate*> mul_gates;
+    std::vector<const FIn1Gate*> eqz_gates;
+    std::vector<const FIn1Gate*> ltz_gates;
     std::vector<const ShuffleGate*> shuffle_gates;
     std::vector<const UnshuffleGate*> unshuffle_gates;
 
@@ -219,6 +241,8 @@ class OnlineEvaluator {
     recp_by_target[1].reserve(level.size());
     recp_by_target[2].reserve(level.size());
     mul_gates.reserve(level.size());
+    eqz_gates.reserve(level.size());
+    ltz_gates.reserve(level.size());
     shuffle_gates.reserve(level.size());
     unshuffle_gates.reserve(level.size());
 
@@ -243,7 +267,11 @@ class OnlineEvaluator {
           mul_gates.push_back(static_cast<const FIn2Gate*>(gp.get()));
           break;
         case GateType::kEqz:
-          throw std::runtime_error("3PC OnlineEvaluator: kEqz is not supported");
+          eqz_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
+          break;
+        case GateType::kLtz:
+          ltz_gates.push_back(static_cast<const FIn1Gate*>(gp.get()));
+          break;
         case GateType::kShuffle:
           shuffle_gates.push_back(static_cast<const ShuffleGate*>(gp.get()));
           break;
@@ -266,6 +294,8 @@ class OnlineEvaluator {
     batchRec(rec_gates);
     batchRecP(recp_by_target);
     batchMul(mul_gates);
+    batchEqz(eqz_gates);
+    batchLtz(ltz_gates);
     batchShuffle(shuffle_gates);
     batchUnshuffle(unshuffle_gates);
 
@@ -496,9 +526,13 @@ class OnlineEvaluator {
   // Output share: RSSShare(z, z_nxt).
   //
   // All n gates are batched: send n elements to prev, recv n from next.
-  void batchMul(const std::vector<const FIn2Gate*>& gates) {
-    if (gates.empty()) return;
-    const size_t n = gates.size();
+  std::vector<RSSShare<T>> multiplyShares(
+      const std::vector<RSSShare<T>>& xs,
+      const std::vector<RSSShare<T>>& ys) {
+    if (xs.size() != ys.size())
+      throw std::invalid_argument("multiplyShares: mismatched input sizes");
+    const size_t n = xs.size();
+    if (n == 0) return {};
 
     std::vector<T> gamma_nxt(n), gamma_prv(n), z(n), z_nxt(n);
     prg_.next_next<T>(gamma_nxt.data(), n);
@@ -507,15 +541,18 @@ class OnlineEvaluator {
     #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
     for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
       const size_t i = static_cast<size_t>(ii);
-      const auto* gate = gates[i];
-      const auto& x = wires_[gate->in1];
-      const auto& y = wires_[gate->in2];
+      const auto& x = xs[i];
+      const auto& y = ys[i];
       const T xl = x.left();
       const T xr = x.right();
       const T yl = y.left();
       const T yr = y.right();
 
-      const T h = xl * yl + xl * yr + xr * yl;
+      // Reduce each product to T before addition.  Besides making the ring
+      // semantics explicit, this avoids signed integer-promotion overflow for
+      // uint16_t while preserving modulo-2^k arithmetic for every width.
+      const T h = static_cast<T>(
+          ringMultiply(xl, yl) + ringMultiply(xl, yr) + ringMultiply(xr, yl));
       z[i] = h + gamma_prv[i] - gamma_nxt[i];
     }
 
@@ -524,11 +561,378 @@ class OnlineEvaluator {
     net_.flush();
     net_.recv_ring<T>(z_nxt.data(), n, next_party(my_pid_));
 
+    std::vector<RSSShare<T>> result(n);
     #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
     for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
       const size_t i = static_cast<size_t>(ii);
-      wires_[gates[i]->out] = RSSShare<T>(z[i], z_nxt[i], my_pid_);
+      result[i] = RSSShare<T>(z[i], z_nxt[i], my_pid_);
     }
+    return result;
+  }
+
+  void batchMul(const std::vector<const FIn2Gate*>& gates) {
+    if (gates.empty()) return;
+    std::vector<RSSShare<T>> xs(gates.size()), ys(gates.size());
+    for (size_t i = 0; i < gates.size(); ++i) {
+      xs[i] = wires_[gates[i]->in1];
+      ys[i] = wires_[gates[i]->in2];
+    }
+    const auto products = multiplyShares(xs, ys);
+    for (size_t i = 0; i < gates.size(); ++i)
+      wires_[gates[i]->out] = products[i];
+  }
+
+  // ── Boolean input sharing used by kEqz and kLtz ──────────────────────────
+  //
+  // Decompose every private value into little-endian bits and XOR-share each
+  // bit as q0 ^ q1 ^ q2.  The Boolean shares use the same replicated layout as
+  // arithmetic RSS:
+  //
+  //   P0: (q0, q1)   P1: (q1, q2)   P2: (q2, q0).
+  //
+  // Only `owner` sees the clear values.  For owner P_k, two components need no
+  // communication:
+  //
+  //   q_{k+1}: pairwise PRG shared by P_k and P_{k+1}
+  //   q_{k+2}: global PRG shared by all three parties
+  //   q_k    : bit ^ q_{k+1} ^ q_{k+2}
+  //
+  // The owner sends only q_k to P_{k-1}, which needs it as its right
+  // component.  P_{k+1} derives both of its components from common PRGs, and
+  // P_{k-1} derives its left component q_{k+2} from the global PRG.  All q_k
+  // bits in the batch are packed into one message.
+  std::vector<BooleanRSSShare> shareBooleanBits(
+      const std::vector<T>& values, int owner) {
+    using U = std::make_unsigned_t<T>;
+    const size_t bits = sizeof(T) * 8;
+    const size_t nbits = values.size() * bits;
+    std::vector<BooleanRSSShare> result(nbits);
+
+    if (my_pid_ == owner) {
+      std::vector<uint8_t> q_next(nbits), q_global(nbits), q_owner(nbits);
+      prg_.next_next<uint8_t>(q_next.data(), nbits);
+      prg_.next_global<uint8_t>(q_global.data(), nbits);
+      for (size_t j = 0; j < nbits; ++j) {
+        const size_t value_idx = j / bits;
+        const size_t bit_idx = j % bits;
+        const uint8_t bit = static_cast<uint8_t>(
+            (static_cast<U>(values[value_idx]) >> bit_idx) & U{1});
+        q_next[j] &= 1U;
+        q_global[j] &= 1U;
+        q_owner[j] = static_cast<uint8_t>(bit ^ q_next[j] ^ q_global[j]);
+        result[j] = {q_owner[j], q_next[j]};
+      }
+      net_.send_ring<uint8_t>(q_owner.data(), nbits, prev_party(owner));
+      net_.flush();
+    } else if (my_pid_ == next_party(owner)) {
+      std::vector<uint8_t> q_next(nbits), q_global(nbits);
+      prg_.next_prev<uint8_t>(q_next.data(), nbits);
+      prg_.next_global<uint8_t>(q_global.data(), nbits);
+      for (size_t j = 0; j < nbits; ++j)
+        result[j] = {static_cast<uint8_t>(q_next[j] & 1U),
+                     static_cast<uint8_t>(q_global[j] & 1U)};
+    } else {
+      std::vector<uint8_t> q_global(nbits), q_owner(nbits);
+      prg_.next_global<uint8_t>(q_global.data(), nbits);
+      net_.recv_ring<uint8_t>(q_owner.data(), nbits, owner);
+      for (size_t j = 0; j < nbits; ++j)
+        result[j] = {static_cast<uint8_t>(q_global[j] & 1U), q_owner[j]};
+    }
+    return result;
+  }
+
+  // ── Boolean RSS AND (1 round) ────────────────────────────────────────────
+  //
+  // For x=(xl,xr) and y=(yl,yr), party P_i computes its local contribution
+  // over F_2:
+  //
+  //   h = (xl & yl) ^ (xl & yr) ^ (xr & yl).
+  //
+  // Pairwise PRG bits re-randomise the result without changing its XOR.  P_i
+  // sends z_i to the previous party and receives z_{i+1} from the next party,
+  // producing the replicated Boolean output (z_i,z_{i+1}).  All ANDs from one
+  // prefix-OR/reduction step are evaluated in the same network round.
+  std::vector<BooleanRSSShare> booleanAnd(
+      const std::vector<BooleanRSSShare>& xs,
+      const std::vector<BooleanRSSShare>& ys) {
+    if (xs.size() != ys.size())
+      throw std::invalid_argument("booleanAnd: mismatched input sizes");
+    const size_t n = xs.size();
+    if (n == 0) return {};
+    std::vector<uint8_t> gamma_nxt(n), gamma_prv(n), z(n), z_nxt(n);
+    prg_.next_next<uint8_t>(gamma_nxt.data(), n);
+    prg_.next_prev<uint8_t>(gamma_prv.data(), n);
+    for (size_t i = 0; i < n; ++i) {
+      gamma_nxt[i] &= 1U;
+      gamma_prv[i] &= 1U;
+      const uint8_t h = static_cast<uint8_t>(
+          (xs[i].left & ys[i].left) ^
+          (xs[i].left & ys[i].right) ^
+          (xs[i].right & ys[i].left));
+      z[i] = static_cast<uint8_t>(h ^ gamma_prv[i] ^ gamma_nxt[i]);
+    }
+    net_.send_ring<uint8_t>(z.data(), n, prev_party(my_pid_));
+    net_.flush();
+    net_.recv_ring<uint8_t>(z_nxt.data(), n, next_party(my_pid_));
+    std::vector<BooleanRSSShare> result(n);
+    for (size_t i = 0; i < n; ++i) result[i] = {z[i], z_nxt[i]};
+    return result;
+  }
+
+  // ── Boolean-to-arithmetic conversion (2 rounds) ─────────────────────────
+  //
+  // A Boolean RSS bit represents q = q0 ^ q1 ^ q2.  First reinterpret each
+  // replicated Boolean component qj as its own arithmetic RSS sharing Qj:
+  // only arithmetic sub-share j contains qj and the other two contain zero.
+  // Then evaluate XOR algebraically in Z_{2^k}:
+  //
+  //   t = Q0 + Q1 - 2*(Q0*Q1)       = q0 ^ q1
+  //   q = t  + Q2 - 2*(t*Q2)        = q0 ^ q1 ^ q2.
+  //
+  // The two products are batched RSS multiplications, so conversion takes two
+  // rounds regardless of the number of gates at the circuit level.
+  std::vector<RSSShare<T>> booleanToArithmetic(
+      const std::vector<BooleanRSSShare>& bits) {
+    const size_t n = bits.size();
+    std::array<std::vector<RSSShare<T>>, 3> components;
+    for (auto& c : components) c.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+      for (int component = 0; component < 3; ++component) {
+        const T left = my_pid_ == component ? static_cast<T>(bits[i].left) : T{};
+        const T right = next_party(my_pid_) == component
+                            ? static_cast<T>(bits[i].right) : T{};
+        components[component][i] = RSSShare<T>(left, right, my_pid_);
+      }
+    }
+
+    const auto p01 = multiplyShares(components[0], components[1]);
+    std::vector<RSSShare<T>> t(n);
+    for (size_t i = 0; i < n; ++i)
+      t[i] = components[0][i] + components[1][i] - p01[i] * T{2};
+    const auto pt2 = multiplyShares(t, components[2]);
+    std::vector<RSSShare<T>> result(n);
+    for (size_t i = 0; i < n; ++i)
+      result[i] = t[i] + components[2][i] - pt2[i] * T{2};
+    return result;
+  }
+
+  // ── Batch: kEqz — RSS zero test via Boolean equality ─────────────────────
+  //
+  // An arithmetic RSS input x has additive components x0+x1+x2 and layout:
+  //
+  //   P0: (x0,x1)   P1: (x1,x2)   P2: (x2,x0).
+  //
+  // Therefore x=0 iff a=b, where P0 can locally compute a=x0+x1 and P1 can
+  // locally compute b=-x2.  P0 and P1 independently bit-decompose and
+  // Boolean-share a and b.  XORing corresponding shares gives difference bits
+  // d_j = a_j ^ b_j without communication.
+  //
+  // Repeated pairwise prefix-OR/reduction steps use
+  //
+  //   u OR v = u ^ v ^ (u AND v)
+  //
+  // until one bit remains.  For a k-bit ring this uses ceil(log2(k)) Boolean
+  // AND rounds and k-1 total ANDs per equality.  The remaining bit is 1 iff
+  // a and b differ, so XORing public 1 into replicated component q0 negates it.
+  // Finally booleanToArithmetic converts the equality bit back to the normal
+  // arithmetic RSS wire representation using two multiplication rounds.
+  //
+  // Every gate at this circuit level is processed together in each round.
+  void batchEqz(const std::vector<const FIn1Gate*>& gates) {
+    if (gates.empty()) return;
+    const size_t n = gates.size();
+    const size_t bits = sizeof(T) * 8;
+    std::vector<T> a(n, T{}), b(n, T{});
+    if (my_pid_ == P0)
+      for (size_t i = 0; i < n; ++i) {
+        const auto& x = wires_[gates[i]->in];
+        a[i] = x.left() + x.right();
+      }
+    if (my_pid_ == P1)
+      for (size_t i = 0; i < n; ++i)
+        b[i] = T{} - wires_[gates[i]->in].right();
+
+    auto a_bits = shareBooleanBits(a, P0);
+    auto b_bits = shareBooleanBits(b, P1);
+    std::vector<std::vector<BooleanRSSShare>> current(n);
+    for (size_t i = 0; i < n; ++i) {
+      current[i].resize(bits);
+      for (size_t bit = 0; bit < bits; ++bit) {
+        const size_t j = i * bits + bit;
+        current[i][bit] = {
+            static_cast<uint8_t>(a_bits[j].left ^ b_bits[j].left),
+            static_cast<uint8_t>(a_bits[j].right ^ b_bits[j].right)};
+      }
+    }
+
+    while (current[0].size() > 1) {
+      const size_t width = current[0].size();
+      std::vector<BooleanRSSShare> lhs, rhs;
+      lhs.reserve(n * (width / 2));
+      rhs.reserve(n * (width / 2));
+      for (size_t i = 0; i < n; ++i)
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          lhs.push_back(current[i][j]);
+          rhs.push_back(current[i][j + 1]);
+        }
+      const auto products = booleanAnd(lhs, rhs);
+      size_t product_idx = 0;
+      std::vector<std::vector<BooleanRSSShare>> next(n);
+      for (size_t i = 0; i < n; ++i) {
+        next[i].reserve((width + 1) / 2);
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          const auto& p = products[product_idx++];
+          next[i].push_back({
+              static_cast<uint8_t>(current[i][j].left ^ current[i][j + 1].left ^ p.left),
+              static_cast<uint8_t>(current[i][j].right ^ current[i][j + 1].right ^ p.right)});
+        }
+        if (width & 1U) next[i].push_back(current[i].back());
+      }
+      current = std::move(next);
+    }
+
+    std::vector<BooleanRSSShare> eq_bits(n);
+    for (size_t i = 0; i < n; ++i) {
+      eq_bits[i] = current[i][0];
+      if (my_pid_ == P0) eq_bits[i].left ^= 1U;
+      if (my_pid_ == P2) eq_bits[i].right ^= 1U;
+    }
+    const auto arithmetic = booleanToArithmetic(eq_bits);
+    for (size_t i = 0; i < n; ++i)
+      wires_[gates[i]->out] = arithmetic[i];
+  }
+
+  // ── Batch: kLtz — sign bit via an MSB-only parallel-prefix adder ─────────
+  //
+  // For x=x0+x1+x2 in Z_{2^k}, P0 locally holds a=x0+x1 and P1 locally holds
+  // x2.  Interpreting x in two's-complement form:
+  //
+  //   x < 0  iff  MSB(a + x2 mod 2^k) = 1.
+  //
+  // P0 and P1 bit-decompose and Boolean-share their respective addends.  For
+  // each bit i, the adder state is:
+  //
+  //   p_i = a_i XOR x2_i             (local)
+  //   g_i = a_i AND x2_i             (one batched Boolean-AND round).
+  //
+  // Only the carry into the MSB is needed.  A lower segment (G_l,P_l) followed
+  // by a higher segment (G_h,P_h) is reduced to:
+  //
+  //   G = G_h XOR (P_h AND G_l)
+  //   P = P_h AND P_l.
+  //
+  // The XOR is valid because a segment cannot both generate and propagate a
+  // carry.  Both ANDs are submitted together, so every reduction level costs
+  // one round.  Reducing bits 0..k-2 takes ceil(log2(k-1)) levels and avoids
+  // constructing unused lower sum bits or the carry out of the MSB.
+  //
+  // With carry-in zero, c_{k-1}=G_{0..k-2}; hence the result bit is
+  // p_{k-1} XOR c_{k-1}.  The final Boolean share is converted to arithmetic
+  // RSS by booleanToArithmetic in two multiplication rounds.
+  void batchLtz(const std::vector<const FIn1Gate*>& gates) {
+    if (gates.empty()) return;
+    const size_t n = gates.size();
+    const size_t bits = sizeof(T) * 8;
+    if (bits == 0) throw std::runtime_error("batchLtz: empty ring type");
+
+    std::vector<T> a(n, T{}), x2(n, T{});
+    if (my_pid_ == P0) {
+      for (size_t i = 0; i < n; ++i) {
+        const auto& x = wires_[gates[i]->in];
+        a[i] = x.left() + x.right();
+      }
+    }
+    if (my_pid_ == P1) {
+      for (size_t i = 0; i < n; ++i)
+        x2[i] = wires_[gates[i]->in].right();
+    }
+
+    const auto a_bits = shareBooleanBits(a, P0);
+    const auto x2_bits = shareBooleanBits(x2, P1);
+    std::vector<BooleanRSSShare> propagate(n * bits);
+    for (size_t j = 0; j < propagate.size(); ++j) {
+      propagate[j] = {
+          static_cast<uint8_t>(a_bits[j].left ^ x2_bits[j].left),
+          static_cast<uint8_t>(a_bits[j].right ^ x2_bits[j].right)};
+    }
+
+    struct PrefixState {
+      BooleanRSSShare generate;
+      BooleanRSSShare propagate;
+    };
+
+    const size_t lower_bits = bits - 1;
+    std::vector<BooleanRSSShare> gen_lhs, gen_rhs;
+    gen_lhs.reserve(n * lower_bits);
+    gen_rhs.reserve(n * lower_bits);
+    for (size_t i = 0; i < n; ++i) {
+      for (size_t bit = 0; bit < lower_bits; ++bit) {
+        const size_t j = i * bits + bit;
+        gen_lhs.push_back(a_bits[j]);
+        gen_rhs.push_back(x2_bits[j]);
+      }
+    }
+    const auto generates = booleanAnd(gen_lhs, gen_rhs);
+
+    std::vector<std::vector<PrefixState>> current(n);
+    size_t generate_idx = 0;
+    for (size_t i = 0; i < n; ++i) {
+      current[i].reserve(lower_bits);
+      for (size_t bit = 0; bit < lower_bits; ++bit) {
+        current[i].push_back(
+            {generates[generate_idx++], propagate[i * bits + bit]});
+      }
+    }
+
+    while (lower_bits != 0 && current[0].size() > 1) {
+      const size_t width = current[0].size();
+      const size_t pairs_per_gate = width / 2;
+      std::vector<BooleanRSSShare> lhs, rhs;
+      lhs.reserve(n * pairs_per_gate * 2);
+      rhs.reserve(n * pairs_per_gate * 2);
+      for (size_t i = 0; i < n; ++i) {
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          const auto& low = current[i][j];
+          const auto& high = current[i][j + 1];
+          lhs.push_back(high.propagate);
+          rhs.push_back(low.generate);
+          lhs.push_back(high.propagate);
+          rhs.push_back(low.propagate);
+        }
+      }
+      const auto products = booleanAnd(lhs, rhs);
+
+      size_t product_idx = 0;
+      std::vector<std::vector<PrefixState>> next(n);
+      for (size_t i = 0; i < n; ++i) {
+        next[i].reserve((width + 1) / 2);
+        for (size_t j = 0; j + 1 < width; j += 2) {
+          const auto& high = current[i][j + 1];
+          const auto& propagated_generate = products[product_idx++];
+          const auto& combined_propagate = products[product_idx++];
+          next[i].push_back({
+              {static_cast<uint8_t>(high.generate.left ^ propagated_generate.left),
+               static_cast<uint8_t>(high.generate.right ^ propagated_generate.right)},
+              combined_propagate});
+        }
+        if (width & 1U) next[i].push_back(current[i].back());
+      }
+      current = std::move(next);
+    }
+
+    std::vector<BooleanRSSShare> sign_bits(n);
+    for (size_t i = 0; i < n; ++i) {
+      const BooleanRSSShare carry =
+          lower_bits == 0 ? BooleanRSSShare{} : current[i][0].generate;
+      const auto& msb_propagate = propagate[i * bits + (bits - 1)];
+      sign_bits[i] = {
+          static_cast<uint8_t>(msb_propagate.left ^ carry.left),
+          static_cast<uint8_t>(msb_propagate.right ^ carry.right)};
+    }
+
+    const auto arithmetic = booleanToArithmetic(sign_bits);
+    for (size_t i = 0; i < n; ++i)
+      wires_[gates[i]->out] = arithmetic[i];
   }
 
   

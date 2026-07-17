@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -35,6 +36,28 @@ struct EqzGatePreproc {
   std::vector<T> r1_bit_mod_shares;
   T r2_mod_share{};
   std::vector<T> r2_lookup_share;
+};
+
+/** XOR-shared Beaver triple over GF(2), held by one compute party. */
+struct BooleanBeaverTripleShare {
+  uint8_t a{0};
+  uint8_t b{0};
+  uint8_t c{0};
+};
+
+/**
+ * Per-kLtz correlated randomness held by one compute party.
+ *
+ * The helper samples a uniform ring mask r and distributes both an arithmetic
+ * sharing of r and XOR sharings of its bits.  It also distributes a daBit u:
+ * the same random bit shared once over GF(2) and once over the arithmetic ring.
+ */
+template <typename T>
+struct LtzGatePreproc {
+  AdditiveShare<T> r;
+  std::vector<uint8_t> r_bit_shares;
+  uint8_t u_boolean_share{0};
+  AdditiveShare<T> u_arithmetic_share;
 };
 
 /**
@@ -122,6 +145,8 @@ template <typename T>
 struct Preprocessing {
   std::vector<BeaverTripleShare<T>> triples;
   std::vector<EqzGatePreproc<T>> eqz;
+  std::vector<BooleanBeaverTripleShare> boolean_triples;
+  std::vector<LtzGatePreproc<T>> ltz;
   std::vector<ShuffleGatePreproc<T>> shuffles;
   std::vector<PermShGatePreproc<T>> permsh;
   std::vector<AmorPermShareGatePreproc<T>> amor_permshare;

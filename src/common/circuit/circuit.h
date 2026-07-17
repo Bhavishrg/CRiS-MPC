@@ -114,20 +114,23 @@ class Circuit {
     return out;
   }
 
-  // ── Single-input gate: kEqz, kRec, kRecP ─────────────────────────────
+  // ── Single-input gate: kEqz, kLtz, kRec, kRecP ───────────────────────
 
   /*
    *
    *   addGate(kEqz, in)         — output is a shared 1 iff input is zero
+   *   addGate(kLtz, in)         — output is a shared 1 iff signed input < 0
    *   addGate(kRec,  in)         — all parties reconstruct
    *   addGate(kRecP, in, target) — only `target` learns the plaintext
    *
    * `owner` is ignored for kRec; it specifies the target party for kRecP.
    */
   wire_t addGate(GateType type, wire_t in, int owner = -1) {
-    if (type != GateType::kEqz && type != GateType::kRec &&
+    if (type != GateType::kEqz && type != GateType::kLtz &&
+        type != GateType::kRec &&
         type != GateType::kRecP)
-      throw std::invalid_argument("Circuit::addGate(1-input): expected kEqz, kRec, or kRecP");
+      throw std::invalid_argument(
+          "Circuit::addGate(1-input): expected kEqz, kLtz, kRec, or kRecP");
     if (type == GateType::kRecP && owner < 0)
       throw std::invalid_argument("Circuit::addGate(kRecP): target party must be >= 0");
     checkWire(in);
@@ -140,6 +143,9 @@ class Circuit {
 
   /// kEqz — output is a shared 1 iff `in` is zero, otherwise shared 0.
   wire_t addEqzGate(wire_t in)           { return addGate(GateType::kEqz, in); }
+
+  /// kLtz — output is the two's-complement sign bit of `in`.
+  wire_t addLtzGate(wire_t in)           { return addGate(GateType::kLtz, in); }
 
   /// Equality convenience: returns shared 1 iff lhs == rhs.
   wire_t addEqGate(wire_t lhs, wire_t rhs) {
@@ -1312,6 +1318,7 @@ class Circuit {
   static bool isInteractive(GateType t) {
     return t == GateType::kMul     ||
            t == GateType::kEqz     ||
+           t == GateType::kLtz     ||
            t == GateType::kRec     ||
            t == GateType::kRecP    ||
            t == GateType::kShuffle ||
@@ -1402,6 +1409,19 @@ class Circuit {
         // reconstruction rounds.
         const auto& g1 = static_cast<const FIn1Gate&>(g);
         return wdepth[g1.in] + 2;
+      }
+
+      case GateType::kLtz: {
+        // One generate round, a logarithmic lower-bit carry prefix, and two
+        // arithmetic multiplications for Boolean-to-arithmetic conversion.
+        const auto& g1 = static_cast<const FIn1Gate&>(g);
+        size_t prefix_rounds = 0;
+        size_t lower_bits = sizeof(T) * 8 - 1;
+        while (lower_bits > 1) {
+          lower_bits = (lower_bits + 1) / 2;
+          ++prefix_rounds;
+        }
+        return wdepth[g1.in] + 1 + prefix_rounds + 2;
       }
 
       case GateType::kShuffle: {
