@@ -636,61 +636,105 @@ class OfflineEvaluator {
     }
   }
 
+  // NOTE on the batching used by this function and by helperGenerateLtz /
+  // computeGenerateLtz below: the pairwise PRG is a deterministic stream
+  // shared between exactly two parties.  Calling next<T>(peer, ptr, count)
+  // once for `count` contiguous elements does not, in general, produce the
+  // same bytes as `count` separate scalar next<T>(peer) calls (emp::PRG
+  // rounds each random_data() call up to whole 16-byte AES blocks, so many
+  // small calls waste far more keystream than one large call).  What must
+  // hold is only that *both* sides of a given peer pair issue exactly the
+  // same sequence of (peer, nbytes) requests, in the same order, so their
+  // two independently-seeded-but-synchronized PRG streams stay in lockstep.
+  // The functions below replace per-element scalar PRG calls with one bulk
+  // call per peer (sized to the exact same total element count the old
+  // scalar loop consumed from that peer), and apply that same restructuring
+  // symmetrically on both the helper and compute sides, so correctness is
+  // preserved while (a) avoiding millions of tiny virtual-ish PRG calls and
+  // (b) allowing the per-gate arithmetic to be parallelized with OpenMP
+  // since no PRG state is touched inside the parallel region anymore.
   void helperGenerateEqz(size_t num_eqz) {
+    if (num_eqz == 0) return;
     const int last = last_compute_pid();
     const size_t bits = RingTraits<T>::bit_width;
     const size_t domain = eqzDomainSize();
-    std::vector<T> missing_last;
-    missing_last.reserve(num_eqz * (bits + domain));
 
-    for (size_t i = 0; i < num_eqz; ++i) {
+    // Per-gate draw layout from party p's PRG stream, in the same relative
+    // order the original scalar code used: r1 (1), then `bits` bit-mask
+    // shares if p != last, then r2 (1), then `domain` lookup shares if
+    // p != last.
+    std::vector<size_t> stride(static_cast<size_t>(num_compute_parties_));
+    std::vector<std::vector<T>> sampled(static_cast<size_t>(num_compute_parties_));
+    for (int p = 0; p < num_compute_parties_; ++p) {
+      const size_t s = 2 + (p != last ? (bits + domain) : 0);
+      stride[static_cast<size_t>(p)] = s;
+      auto& buf = sampled[static_cast<size_t>(p)];
+      buf.resize(s * num_eqz);
+      pairwise_prg_.next<T>(p, buf.data(), buf.size());
+    }
+
+    std::vector<T> missing_last(num_eqz * (bits + domain));
+
+    #pragma omp parallel for if(num_eqz >= kParallelPreprocThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(num_eqz); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+
       T r1{};
-      for (int p = 0; p < num_compute_parties_; ++p)
-        r1 += pairwise_prg_.next<T>(p);
+      for (int p = 0; p < num_compute_parties_; ++p) {
+        r1 += sampled[static_cast<size_t>(p)][stride[static_cast<size_t>(p)] * i];
+      }
 
       std::vector<size_t> bit_share_sums(bits, 0);
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == last) continue;
+        const auto& buf = sampled[static_cast<size_t>(p)];
+        const size_t base = stride[static_cast<size_t>(p)] * i + 1;
         for (size_t bit = 0; bit < bits; ++bit) {
           bit_share_sums[bit] =
-              (bit_share_sums[bit] + static_cast<size_t>(sampleModWithParty(p, domain))) %
+              (bit_share_sums[bit] +
+               static_cast<size_t>(modDomainValue(buf[base + bit], domain))) %
               domain;
         }
       }
 
+      T* missing_bits = &missing_last[i * (bits + domain)];
       for (size_t bit = 0; bit < bits; ++bit) {
         const size_t target = static_cast<size_t>(bitAt(r1, bit));
-        const size_t missing =
-            (target + domain - bit_share_sums[bit]) % domain;
-        missing_last.push_back(static_cast<T>(missing));
+        const size_t missing = (target + domain - bit_share_sums[bit]) % domain;
+        missing_bits[bit] = static_cast<T>(missing);
       }
 
       size_t r2 = 0;
       for (int p = 0; p < num_compute_parties_; ++p) {
-        r2 = (r2 + static_cast<size_t>(sampleModWithParty(p, domain))) %
-             domain;
+        const auto& buf = sampled[static_cast<size_t>(p)];
+        const size_t s = stride[static_cast<size_t>(p)];
+        const size_t r2_idx = s * i + (p != last ? 1 + bits : 1);
+        r2 = (r2 + static_cast<size_t>(modDomainValue(buf[r2_idx], domain))) % domain;
       }
 
       std::vector<T> lookup_share_sums(domain, T{});
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == last) continue;
-        for (size_t idx = 0; idx < domain; ++idx)
-          lookup_share_sums[idx] += pairwise_prg_.next<T>(p);
+        const auto& buf = sampled[static_cast<size_t>(p)];
+        const size_t base = stride[static_cast<size_t>(p)] * i + 2 + bits;
+        for (size_t idx = 0; idx < domain; ++idx) {
+          lookup_share_sums[idx] += buf[base + idx];
+        }
       }
 
+      T* missing_lookup = missing_bits + bits;
       for (size_t idx = 0; idx < domain; ++idx) {
         const T target = (idx == r2) ? T{1} : T{0};
-        missing_last.push_back(target - lookup_share_sums[idx]);
+        missing_lookup[idx] = target - lookup_share_sums[idx];
       }
     }
 
-    if (!missing_last.empty()) {
-      net_.send_ring<T>(missing_last.data(), missing_last.size(), last);
-      net_.flush(last);
-    }
+    net_.send_ring<T>(missing_last.data(), missing_last.size(), last);
+    net_.flush(last);
   }
 
   void computeGenerateEqz(size_t num_eqz) {
+    if (num_eqz == 0) return;
     const int helper = helper_pid();
     const int last = last_compute_pid();
     const size_t bits = RingTraits<T>::bit_width;
@@ -702,29 +746,35 @@ class OfflineEvaluator {
       net_.recv_ring<T>(received_missing.data(), received_missing.size(), helper);
     }
 
-    size_t received_offset = 0;
-    for (size_t i = 0; i < num_eqz; ++i) {
+    // Same per-gate layout as the helper side, from this party's point of
+    // view of its shared stream with the helper.
+    const size_t stride = 2 + (pid_ != last ? (bits + domain) : 0);
+    std::vector<T> sampled(stride * num_eqz);
+    pairwise_prg_.next<T>(helper, sampled.data(), sampled.size());
+
+    #pragma omp parallel for if(num_eqz >= kParallelPreprocThreshold) schedule(static)
+    for (long long ii = 0; ii < static_cast<long long>(num_eqz); ++ii) {
+      const size_t i = static_cast<size_t>(ii);
+      const size_t base = stride * i;
+
       EqzGatePreproc<T> pp;
-      pp.r1 = AdditiveShare<T>(pairwise_prg_.next<T>(helper));
-
+      pp.r1 = AdditiveShare<T>(sampled[base]);
       pp.r1_bit_mod_shares.resize(bits);
-      if (pid_ == last) {
-        for (size_t bit = 0; bit < bits; ++bit)
-          pp.r1_bit_mod_shares[bit] = received_missing[received_offset++];
-      } else {
-        for (size_t bit = 0; bit < bits; ++bit)
-          pp.r1_bit_mod_shares[bit] = sampleModWithParty(helper, domain);
-      }
-
-      pp.r2_mod_share = sampleModWithParty(helper, domain);
-
       pp.r2_lookup_share.resize(domain);
+
       if (pid_ == last) {
+        const T* missing = &received_missing[i * (bits + domain)];
+        for (size_t bit = 0; bit < bits; ++bit)
+          pp.r1_bit_mod_shares[bit] = missing[bit];
+        pp.r2_mod_share = modDomainValue(sampled[base + 1], domain);
         for (size_t idx = 0; idx < domain; ++idx)
-          pp.r2_lookup_share[idx] = received_missing[received_offset++];
+          pp.r2_lookup_share[idx] = missing[bits + idx];
       } else {
+        for (size_t bit = 0; bit < bits; ++bit)
+          pp.r1_bit_mod_shares[bit] = modDomainValue(sampled[base + 1 + bit], domain);
+        pp.r2_mod_share = modDomainValue(sampled[base + 1 + bits], domain);
         for (size_t idx = 0; idx < domain; ++idx)
-          pp.r2_lookup_share[idx] = pairwise_prg_.next<T>(helper);
+          pp.r2_lookup_share[idx] = sampled[base + 2 + bits + idx];
       }
 
       preproc_.eqz[i] = std::move(pp);
@@ -739,65 +789,112 @@ class OfflineEvaluator {
   // All shares except the final compute party's correction shares come from
   // helper-compute common PRGs.
   void helperGenerateLtz(size_t num_ltz) {
+    if (num_ltz == 0) return;
     const int last = last_compute_pid();
     const size_t bits = RingTraits<T>::bit_width;
-    const size_t triples_per_gate = booleanTriplesPerLtz();
-    emp::PRG local_prg;
+    const size_t tpg = booleanTriplesPerLtz();
+
+    // Helper-local secret r/u values are never shared with any peer's PRG
+    // stream, so batching their generation has no synchronization
+    // requirement at all.
+    std::vector<T> r_vals(num_ltz);
+    std::vector<uint8_t> u_vals(num_ltz);
+    {
+      emp::PRG local_prg;
+      local_prg.random_data(r_vals.data(), static_cast<int>(num_ltz * sizeof(T)));
+      std::vector<uint8_t> u_raw(num_ltz);
+      local_prg.random_data(u_raw.data(), static_cast<int>(num_ltz));
+      for (size_t g = 0; g < num_ltz; ++g) u_vals[g] = u_raw[g] & 1U;
+    }
+
+    // Per-peer bulk PRG draws.  For a fixed peer p != last, this party's
+    // per-gate contribution (in visiting order) is: 1 arithmetic r-share, 1
+    // arithmetic u-share (both T-typed), and `bits` boolean bit-shares, 1
+    // boolean u-share, and 3 boolean values per triple (a, b, c) (all
+    // uint8_t-typed).  Peer p == last only ever contributes the `a`/`b`
+    // halves of each triple.  T-typed and uint8_t-typed draws are grouped
+    // into two separate bulk calls (T first, then uint8_t) rather than
+    // interleaved scalar calls; computeGenerateLtz mirrors this exact
+    // grouping so the two sides of each peer pair stay in lockstep.
+    const size_t u8_stride_non_last = bits + 1 + 3 * tpg;
+    const size_t u8_stride_last = 2 * tpg;
+    std::vector<std::vector<T>> t_buf(static_cast<size_t>(num_compute_parties_));
+    std::vector<std::vector<uint8_t>> u8_buf(static_cast<size_t>(num_compute_parties_));
+
+    for (int p = 0; p < num_compute_parties_; ++p) {
+      auto& u8 = u8_buf[static_cast<size_t>(p)];
+      if (p == last) {
+        u8.resize(u8_stride_last * num_ltz);
+        pairwise_prg_.next<uint8_t>(p, u8.data(), u8.size());
+        continue;
+      }
+      auto& tb = t_buf[static_cast<size_t>(p)];
+      tb.resize(2 * num_ltz);
+      pairwise_prg_.next<T>(p, tb.data(), tb.size());
+
+      u8.resize(u8_stride_non_last * num_ltz);
+      pairwise_prg_.next<uint8_t>(p, u8.data(), u8.size());
+    }
 
     std::vector<T> last_r(num_ltz), last_u_arith(num_ltz);
     std::vector<uint8_t> last_r_bits(num_ltz * bits);
     std::vector<uint8_t> last_u_bool(num_ltz);
-    std::vector<uint8_t> last_c(num_ltz * triples_per_gate);
+    std::vector<uint8_t> last_c(num_ltz * tpg);
 
-    for (size_t gate = 0; gate < num_ltz; ++gate) {
-      T r{};
-      local_prg.random_data(&r, sizeof(T));
+    #pragma omp parallel for if(num_ltz >= kParallelPreprocThreshold) schedule(static)
+    for (long long gg = 0; gg < static_cast<long long>(num_ltz); ++gg) {
+      const size_t gate = static_cast<size_t>(gg);
+      const T r = r_vals[gate];
+      const uint8_t u = u_vals[gate];
+
       T r_share_sum{};
+      T u_share_sum{};
       for (int p = 0; p < num_compute_parties_; ++p) {
-        if (p != last) r_share_sum += pairwise_prg_.next<T>(p);
+        if (p == last) continue;
+        const auto& tb = t_buf[static_cast<size_t>(p)];
+        r_share_sum += tb[gate * 2];
+        u_share_sum += tb[gate * 2 + 1];
       }
       last_r[gate] = r - r_share_sum;
+      last_u_arith[gate] = static_cast<T>(u) - u_share_sum;
 
       for (size_t bit = 0; bit < bits; ++bit) {
         uint8_t share_xor = 0;
         for (int p = 0; p < num_compute_parties_; ++p) {
           if (p == last) continue;
-          share_xor ^= static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(p) & 1U);
+          const auto& u8 = u8_buf[static_cast<size_t>(p)];
+          share_xor ^= static_cast<uint8_t>(
+              u8[gate * u8_stride_non_last + bit] & 1U);
         }
         const uint8_t r_bit = static_cast<uint8_t>((r >> bit) & T{1});
-        last_r_bits[gate * bits + bit] =
-            static_cast<uint8_t>(r_bit ^ share_xor);
+        last_r_bits[gate * bits + bit] = static_cast<uint8_t>(r_bit ^ share_xor);
       }
-
-      uint8_t u = 0;
-      local_prg.random_data(&u, sizeof(u));
-      u &= 1U;
-      T u_share_sum{};
-      for (int p = 0; p < num_compute_parties_; ++p) {
-        if (p != last) u_share_sum += pairwise_prg_.next<T>(p);
-      }
-      last_u_arith[gate] = static_cast<T>(u) - u_share_sum;
 
       uint8_t u_share_xor = 0;
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == last) continue;
-        u_share_xor ^=
-            static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(p) & 1U);
+        const auto& u8 = u8_buf[static_cast<size_t>(p)];
+        u_share_xor ^= static_cast<uint8_t>(
+            u8[gate * u8_stride_non_last + bits] & 1U);
       }
       last_u_bool[gate] = static_cast<uint8_t>(u ^ u_share_xor);
 
-      for (size_t t = 0; t < triples_per_gate; ++t) {
+      for (size_t t = 0; t < tpg; ++t) {
         uint8_t a = 0, b = 0, c_share_xor = 0;
         for (int p = 0; p < num_compute_parties_; ++p) {
-          a ^= static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(p) & 1U);
-          b ^= static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(p) & 1U);
-          if (p != last) {
-            c_share_xor ^=
-                static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(p) & 1U);
+          const auto& u8 = u8_buf[static_cast<size_t>(p)];
+          if (p == last) {
+            const size_t base = gate * u8_stride_last + 2 * t;
+            a ^= static_cast<uint8_t>(u8[base] & 1U);
+            b ^= static_cast<uint8_t>(u8[base + 1] & 1U);
+          } else {
+            const size_t base = gate * u8_stride_non_last + bits + 1 + 3 * t;
+            a ^= static_cast<uint8_t>(u8[base] & 1U);
+            b ^= static_cast<uint8_t>(u8[base + 1] & 1U);
+            c_share_xor ^= static_cast<uint8_t>(u8[base + 2] & 1U);
           }
         }
-        last_c[gate * triples_per_gate + t] =
-            static_cast<uint8_t>((a & b) ^ c_share_xor);
+        last_c[gate * tpg + t] = static_cast<uint8_t>((a & b) ^ c_share_xor);
       }
     }
 
@@ -810,10 +907,11 @@ class OfflineEvaluator {
   }
 
   void computeGenerateLtz(size_t num_ltz) {
+    if (num_ltz == 0) return;
     const int helper = helper_pid();
     const int last = last_compute_pid();
     const size_t bits = RingTraits<T>::bit_width;
-    const size_t triples_per_gate = booleanTriplesPerLtz();
+    const size_t tpg = booleanTriplesPerLtz();
 
     std::vector<T> received_r, received_u_arith;
     std::vector<uint8_t> received_r_bits, received_u_bool, received_c;
@@ -822,7 +920,7 @@ class OfflineEvaluator {
       received_r_bits.resize(num_ltz * bits);
       received_u_arith.resize(num_ltz);
       received_u_bool.resize(num_ltz);
-      received_c.resize(num_ltz * triples_per_gate);
+      received_c.resize(num_ltz * tpg);
       net_.recv_ring<T>(received_r.data(), received_r.size(), helper);
       net_.recv_ring<uint8_t>(received_r_bits.data(), received_r_bits.size(), helper);
       net_.recv_ring<T>(received_u_arith.data(), received_u_arith.size(), helper);
@@ -830,36 +928,59 @@ class OfflineEvaluator {
       net_.recv_ring<uint8_t>(received_c.data(), received_c.size(), helper);
     }
 
-    for (size_t gate = 0; gate < num_ltz; ++gate) {
-      LtzGatePreproc<T> pp;
-      pp.r = AdditiveShare<T>(
-          pid_ == last ? received_r[gate] : pairwise_prg_.next<T>(helper));
+    // Mirrors helperGenerateLtz's per-peer grouping exactly, from this
+    // party's point of view of its shared stream with the helper.
+    const size_t u8_stride_non_last = bits + 1 + 3 * tpg;
+    const size_t u8_stride_last = 2 * tpg;
 
+    std::vector<T> t_buf;
+    std::vector<uint8_t> u8_buf;
+    if (pid_ != last) {
+      t_buf.resize(2 * num_ltz);
+      pairwise_prg_.next<T>(helper, t_buf.data(), t_buf.size());
+      u8_buf.resize(u8_stride_non_last * num_ltz);
+      pairwise_prg_.next<uint8_t>(helper, u8_buf.data(), u8_buf.size());
+    } else {
+      u8_buf.resize(u8_stride_last * num_ltz);
+      pairwise_prg_.next<uint8_t>(helper, u8_buf.data(), u8_buf.size());
+    }
+
+    #pragma omp parallel for if(num_ltz >= kParallelPreprocThreshold) schedule(static)
+    for (long long gg = 0; gg < static_cast<long long>(num_ltz); ++gg) {
+      const size_t gate = static_cast<size_t>(gg);
+      LtzGatePreproc<T> pp;
       pp.r_bit_shares.resize(bits);
-      for (size_t bit = 0; bit < bits; ++bit) {
-        pp.r_bit_shares[bit] =
-            pid_ == last
-                ? received_r_bits[gate * bits + bit]
-                : static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(helper) & 1U);
+
+      if (pid_ == last) {
+        pp.r = AdditiveShare<T>(received_r[gate]);
+        for (size_t bit = 0; bit < bits; ++bit)
+          pp.r_bit_shares[bit] = received_r_bits[gate * bits + bit];
+        pp.u_arithmetic_share = AdditiveShare<T>(received_u_arith[gate]);
+        pp.u_boolean_share = received_u_bool[gate];
+      } else {
+        pp.r = AdditiveShare<T>(t_buf[gate * 2]);
+        pp.u_arithmetic_share = AdditiveShare<T>(t_buf[gate * 2 + 1]);
+
+        const size_t base = gate * u8_stride_non_last;
+        for (size_t bit = 0; bit < bits; ++bit)
+          pp.r_bit_shares[bit] = static_cast<uint8_t>(u8_buf[base + bit] & 1U);
+        pp.u_boolean_share = static_cast<uint8_t>(u8_buf[base + bits] & 1U);
       }
 
-      pp.u_arithmetic_share = AdditiveShare<T>(
-          pid_ == last ? received_u_arith[gate]
-                       : pairwise_prg_.next<T>(helper));
-      pp.u_boolean_share =
-          pid_ == last
-              ? received_u_bool[gate]
-              : static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(helper) & 1U);
-
-      for (size_t t = 0; t < triples_per_gate; ++t) {
+      for (size_t t = 0; t < tpg; ++t) {
         BooleanBeaverTripleShare triple;
-        triple.a = static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(helper) & 1U);
-        triple.b = static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(helper) & 1U);
-        triple.c =
-            pid_ == last
-                ? received_c[gate * triples_per_gate + t]
-                : static_cast<uint8_t>(pairwise_prg_.next<uint8_t>(helper) & 1U);
-        preproc_.boolean_triples[gate * triples_per_gate + t] = triple;
+        if (pid_ == last) {
+          const size_t base = gate * u8_stride_last + 2 * t;
+          triple.a = static_cast<uint8_t>(u8_buf[base] & 1U);
+          triple.b = static_cast<uint8_t>(u8_buf[base + 1] & 1U);
+          triple.c = received_c[gate * tpg + t];
+        } else {
+          const size_t base = gate * u8_stride_non_last + bits + 1 + 3 * t;
+          triple.a = static_cast<uint8_t>(u8_buf[base] & 1U);
+          triple.b = static_cast<uint8_t>(u8_buf[base + 1] & 1U);
+          triple.c = static_cast<uint8_t>(u8_buf[base + 2] & 1U);
+        }
+        preproc_.boolean_triples[gate * tpg + t] = triple;
       }
       preproc_.ltz[gate] = std::move(pp);
     }

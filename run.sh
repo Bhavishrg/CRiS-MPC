@@ -26,6 +26,7 @@ if [ $# -lt 1 ]; then
     echo "  - bench_amor_permshare"
     echo "  - bench_propagate"
     echo "  - bench_unshuffle"
+    echo "  - microbench_graphiti_init"
     echo "  - bench_bfs_mpa"
     echo "  - bench_pagerank_mpa"
     echo "  - bench_dcc_pagerank_mpa"
@@ -255,7 +256,7 @@ case "$BENCHMARK_NAME" in
     bench_sort)
         shape_dir="vec_${vec_size}/bits_${bit_width}"
         ;;
-    bench_bfs_mpa|bench_pagerank_mpa|bench_dcc_pagerank_mpa)
+    microbench_graphiti_init|bench_bfs_mpa|bench_pagerank_mpa|bench_dcc_pagerank_mpa)
         if [ "$graph_size" != "unspecified_graph_size" ]; then
             shape_dir="graph_${graph_size}"
         else
