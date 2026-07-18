@@ -193,8 +193,8 @@ class Net3P {
    */
   /**
    * Set SO_SNDBUF and SO_RCVBUF on every socket owned by this party to
-   * `buffer_size` bytes. emp::NetIO exposes the underlying fd via its
-   * public `consocket` member, so this sets the option directly.
+    * `buffer_size` bytes. The underlying socket fd member in emp::NetIO
+    * differs across emp-tool versions, so access it through netio_fd().
    *
    * The kernel may cap the value at net.core.{r,w}mem_max (and doubles
    * whatever it grants for bookkeeping overhead); if large sends/recvs
@@ -206,8 +206,8 @@ class Net3P {
    */
   void increaseSocketBuffers(int buffer_size) {
     auto set_buf = [&](emp::NetIO* io, const char* label) {
-      if (io == nullptr || io->consocket < 0) return;
-      const int fd = io->consocket;
+      const int fd = netio_fd(io);
+      if (fd < 0) return;
       if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
         std::fprintf(stderr,
             "[Net3P P%d] setsockopt(SO_SNDBUF) on %s failed: %s\n",
@@ -227,10 +227,11 @@ class Net3P {
 
     // Report the actual granted size so callers can detect kernel capping
     // via net.core.{r,w}mem_max.
-    if (send_to_nxt_ != nullptr && send_to_nxt_->consocket >= 0) {
+    const int sample_fd = netio_fd(send_to_nxt_);
+    if (sample_fd >= 0) {
       int actual_sndbuf = 0;
       socklen_t len = sizeof(actual_sndbuf);
-      getsockopt(send_to_nxt_->consocket, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
+      getsockopt(sample_fd, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
       std::fprintf(stderr,
           "[Net3P P%d] Requested SO_SNDBUF=%d, kernel granted=%d "
           "(if smaller than requested, raise net.core.wmem_max/rmem_max).\n",
@@ -239,6 +240,26 @@ class Net3P {
   }
 
  private:
+  template <typename T>
+  static auto netio_fd_impl(T* io, int) -> decltype(io->consocket, int{}) {
+    return io->consocket;
+  }
+
+  template <typename T>
+  static auto netio_fd_impl(T* io, long) -> decltype(io->socket, int{}) {
+    return io->socket;
+  }
+
+  template <typename T>
+  static int netio_fd_impl(T*, ...) {
+    return -1;
+  }
+
+  static int netio_fd(emp::NetIO* io) {
+    if (io == nullptr) return -1;
+    return netio_fd_impl(io, 0);
+  }
+
   // ── Port assignment ───────────────────────────────────────────────────────────
   /**
    * Canonical port for the directed edge sender→receiver.

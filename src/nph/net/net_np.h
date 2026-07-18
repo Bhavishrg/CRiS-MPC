@@ -167,23 +167,31 @@ class NetNP {
     if (pid_ >= peer_limit) return;
 
     std::vector<uint8_t> send_buf(bytes_per_peer, 0);
-    for (int to = 0; to < peer_limit; ++to) {
-      if (to == pid_) continue;
-      send_bytes(send_buf.data(), send_buf.size(), to);
-    }
-    flush();
-
     std::vector<uint8_t> recv_buf(bytes_per_peer);
-    for (int from = 0; from < peer_limit; ++from) {
-      if (from == pid_) continue;
-      recv_bytes(recv_buf.data(), recv_buf.size(), from);
+
+    // Avoid deadlock on large warmups: a global "send-all then recv-all"
+    // pattern can block once socket buffers fill. Use a deterministic pairwise
+    // order so each communicating pair always has one sender and one receiver
+    // at a time.
+    for (int peer = 0; peer < peer_limit; ++peer) {
+      if (peer == pid_) continue;
+
+      if (pid_ < peer) {
+        send_bytes(send_buf.data(), send_buf.size(), peer);
+        flush(peer);
+        recv_bytes(recv_buf.data(), recv_buf.size(), peer);
+      } else {
+        recv_bytes(recv_buf.data(), recv_buf.size(), peer);
+        send_bytes(send_buf.data(), send_buf.size(), peer);
+        flush(peer);
+      }
     }
   }
 
   /**
    * Set SO_SNDBUF and SO_RCVBUF on every socket owned by this party to
-   * `buffer_size` bytes. emp::NetIO exposes the underlying fd via its
-   * public `consocket` member, so this sets the option directly.
+    * `buffer_size` bytes. The underlying socket fd member in emp::NetIO
+    * differs across emp-tool versions, so access it through netio_fd().
    *
    * The kernel may cap the value at net.core.{r,w}mem_max (and doubles
    * whatever it grants for bookkeeping overhead); if large sends/recvs
@@ -195,8 +203,8 @@ class NetNP {
    */
   void increaseSocketBuffers(int buffer_size) {
     auto set_buf = [&](emp::NetIO* io, int party) {
-      if (io == nullptr || io->consocket < 0) return;
-      const int fd = io->consocket;
+      const int fd = netio_fd(io);
+      if (fd < 0) return;
       if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_size, sizeof(buffer_size)) != 0) {
         std::fprintf(stderr,
             "[NetNP P%d] setsockopt(SO_SNDBUF) to party %d failed: %s\n",
@@ -223,10 +231,11 @@ class NetNP {
     for (int to = 0; to < total_parties_; ++to) {
       if (to == pid_) continue;
       emp::NetIO* io = send_ios_[static_cast<size_t>(to)];
-      if (io == nullptr || io->consocket < 0) continue;
+      const int fd = netio_fd(io);
+      if (fd < 0) continue;
       int actual_sndbuf = 0;
       socklen_t len = sizeof(actual_sndbuf);
-      getsockopt(io->consocket, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
+      getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_sndbuf, &len);
       std::fprintf(stderr,
           "[NetNP P%d] Requested SO_SNDBUF=%d, kernel granted=%d "
           "(if smaller than requested, raise net.core.wmem_max/rmem_max).\n",
@@ -236,6 +245,26 @@ class NetNP {
   }
 
  private:
+  template <typename T>
+  static auto netio_fd_impl(T* io, int) -> decltype(io->consocket, int{}) {
+    return io->consocket;
+  }
+
+  template <typename T>
+  static auto netio_fd_impl(T* io, long) -> decltype(io->socket, int{}) {
+    return io->socket;
+  }
+
+  template <typename T>
+  static int netio_fd_impl(T*, ...) {
+    return -1;
+  }
+
+  static int netio_fd(emp::NetIO* io) {
+    if (io == nullptr) return -1;
+    return netio_fd_impl(io, 0);
+  }
+
   static int directed_port(int sender, int receiver, int base) {
     // Dense encoding of all directed edges for a complete directed graph.
     // For fixed sender, receivers are packed in increasing order excluding self.
