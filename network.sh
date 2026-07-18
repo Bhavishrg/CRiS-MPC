@@ -22,6 +22,112 @@ function tc_wan() {
     sudo tc qdisc add dev lo parent 1:10 handle 10:0 netem delay "${latency}" 3ms 25% distribution normal
 }
 
+# Give every unordered NPH process pair an independent bandwidth budget.
+#
+# NetNP creates one TCP socket for each directed edge sender -> receiver. Its
+# stable server-port encoding is:
+#
+#   base_port + sender * 1024 + (receiver > sender ? receiver - 1 : receiver)
+#
+# For an unordered pair {i,j}, both directed sockets i->j and j->i are placed in
+# the same HTB class. TCP packets with either server port as source are included
+# too, so ACK traffic receives the same delay and consumes the same pair budget.
+# Different pairs use different sibling classes and therefore do not share a
+# bandwidth ceiling.
+#
+# NPH's --num-parties is the number of compute parties; the helper is one extra
+# process. Thus `tc_nph_pairs 5 ...` creates C(6,2)=15 independently shaped
+# pair classes.
+#
+# Usage:
+#   tc_nph_pairs <compute-parties> <base-port> [latency] [bandwidth] [jitter] [correlation]
+#
+# Example:
+#   tc_nph_pairs 5 14900 50ms 100Mbit
+#   ./run.sh microbench_graphiti_init --protocol nph --num-parties 5 \
+#       --port 14900 --graph-size 10000
+#
+# This setup matches IPv4 loopback traffic, which is what --peer 127.0.0.1 uses.
+function tc_nph_pairs() {
+    local num_compute_parties="${1:-}"
+    local base_port="${2:-}"
+    local latency="${3:-50ms}"
+    local bandwidth="${4:-100Mbit}"
+    local jitter="${5:-3ms}"
+    local correlation="${6:-25%}"
+    local fallback_bandwidth="${TC_FALLBACK_BANDWIDTH:-100Gbit}"
+
+    if ! [[ "${num_compute_parties}" =~ ^[0-9]+$ ]] ||
+       [ "${num_compute_parties}" -lt 2 ]; then
+        echo "tc_nph_pairs: compute-parties must be an integer >= 2" >&2
+        return 1
+    fi
+    if ! [[ "${base_port}" =~ ^[0-9]+$ ]] ||
+       [ "${base_port}" -lt 1 ] || [ "${base_port}" -gt 65535 ]; then
+        echo "tc_nph_pairs: base-port must be an integer in 1..65535" >&2
+        return 1
+    fi
+
+    local total_processes=$((num_compute_parties + 1))
+    local max_sender=$((total_processes - 1))
+    local max_recv_index=$((total_processes - 2))
+    local max_port=$((base_port + max_sender * 1024 + max_recv_index))
+    if [ "${max_port}" -gt 65535 ]; then
+        echo "tc_nph_pairs: NPH port range ends at ${max_port}, above 65535" >&2
+        echo "tc_nph_pairs: choose a lower base port or fewer parties" >&2
+        return 1
+    fi
+
+    # All unrelated loopback traffic falls into this effectively unshaped
+    # class. Pair classes are direct siblings of it, so there is no common
+    # 100-Mbit parent bottleneck.
+    sudo tc qdisc del dev lo root 2>/dev/null || true
+    sudo tc qdisc add dev lo root handle 1: htb default fff0
+    sudo tc class add dev lo parent 1: classid 1:fff0 htb \
+        rate "${fallback_bandwidth}" ceil "${fallback_bandwidth}"
+
+    local class_minor=10
+    local left
+    local right
+    for ((left = 0; left < total_processes; ++left)); do
+        for ((right = left + 1; right < total_processes; ++right)); do
+            local left_to_right_index=$((right > left ? right - 1 : right))
+            local right_to_left_index=$((left > right ? left - 1 : left))
+            local port_left_to_right=$((base_port + left * 1024 + left_to_right_index))
+            local port_right_to_left=$((base_port + right * 1024 + right_to_left_index))
+            local flowid="1:${class_minor}"
+
+            sudo tc class add dev lo parent 1: classid "${flowid}" htb \
+                rate "${bandwidth}" ceil "${bandwidth}"
+            sudo tc qdisc add dev lo parent "${flowid}" handle "${class_minor}:" \
+                netem delay "${latency}" "${jitter}" "${correlation}" \
+                distribution normal
+
+            # Data packets match destination server ports. Reverse TCP packets
+            # such as ACKs match the corresponding source server ports.
+            local port
+            for port in "${port_left_to_right}" "${port_right_to_left}"; do
+                sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+                    match ip protocol 6 0xff \
+                    match ip dport "${port}" 0xffff \
+                    flowid "${flowid}"
+                sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+                    match ip protocol 6 0xff \
+                    match ip sport "${port}" 0xffff \
+                    flowid "${flowid}"
+            done
+
+            echo "NPH pair ${left}-${right}: ${bandwidth}, ${latency}, " \
+                 "ports ${port_left_to_right}/${port_right_to_left}, class ${flowid}"
+            class_minor=$((class_minor + 1))
+        done
+    done
+
+    local num_pair_classes=$((total_processes * (total_processes - 1) / 2))
+    echo "Configured ${num_pair_classes} independent NPH pair classes on lo."
+    echo "Use the same base port (${base_port}) with run.sh --port."
+}
+
 # Raise the kernel-wide caps on socket send/receive buffer sizes.
 # setsockopt(SO_SNDBUF/SO_RCVBUF, ...) silently truncates to
 # net.core.wmem_max / net.core.rmem_max, so a large increaseSocketBuffers()
@@ -39,4 +145,3 @@ function raise_socket_mem_max() {
     sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 ${bytes}"
     sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 ${bytes}"
 }
-
