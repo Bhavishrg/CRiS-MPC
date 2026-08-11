@@ -1,243 +1,253 @@
 # CRiS-MPC
 
-CRiS-MPC is a C++ implementation of a **3-party semi-honest secure computation framework** based on replicated secret sharing.
+CRiS-MPC is a C++17 framework for semi-honest secure multiparty computation over rings of the form $\mathbb{Z}_{2^k}$. It provides a circuit-building API, offline and online evaluators, and two protocol backends for research and benchmarking.
 
-The framework supports arithmetic computation over rings and includes MPC primitives such as multiplication, reconstruction, permutation, shuffle, and higher-level subcircuits.
+## Protocols
 
-CRiS-MPC is intended for research and benchmarking.
+| Protocol | Sharing | Processes |
+| --- | --- | --- |
+| `rss3` | Three-party replicated secret sharing | Three compute parties, with PIDs `0`, `1`, and `2` |
+| `nph` | N-party additive sharing | `n` compute parties with PIDs `0..n-1`, plus a preprocessing helper with PID `n` |
 
+## Arithmetic primitives
 
-## Repository Structure
+The circuit API provides:
+
+- Secret input sharing
+- Addition and subtraction of shared values
+- Addition, subtraction, and multiplication by a public constant
+- Multiplication of two shared values
+- Equality to zero and equality of two shared values
+- Signed less-than-zero comparison
+- Reconstruction to all parties
+- Reconstruction to one selected party
+
+Arithmetic is performed using native unsigned 8-, 16-, 32-, or 64-bit types. Overflow implements reduction modulo $2^k$. Signed comparison interprets the most significant bit using two's-complement representation.
+
+## Repository structure
 
 ```text
 CRiS-MPC/
 ├── src/
+│   ├── common/
+│   │   ├── circuit/           # Gates, circuit construction, and level ordering
+│   │   ├── protocol_runner.h  # Common RSS3/NPH execution interface
+│   │   └── types.h            # Ring and wire types
 │   ├── 3pc/
-│   │   ├── arith/
-│   │   │   ├── offline_evaluator.h
-│   │   │   └── online_evaluator.h
-│   │   ├── utils/
-│   │   │   ├── prg3p.h
-│   │   │   ├── share.h
-│   │   │   └── types.h
-│   │   └── net/
-│   │       └── net3p.h
-│   ├── nph/
-│       ├── arith/
-│       │   ├── offline_evaluator.h
-│       │   └── online_evaluator.h
-│       ├── net/
-│       │   └── net_np.h
-│       └── utils/
-│           ├── preproc.h
-│           ├── prg_np.h
-│           ├── share.h
-│           └── types.h
-│   └── common/
-│       ├── circuit/
-│       │   ├── circuit.h
-│       │   └── gate.h
-│       ├── protocol_runner.h
-│       └── types.h
-├── benchmark/
-│   ├── primitives/
-│   │   ├── bench_amor_permshare.cpp
-│   │   ├── bench_gate.cpp
-│   │   ├── bench_linear.cpp
-│   │   ├── bench_mult.cpp
-│   │   ├── bench_permsh.cpp
-│   │   ├── bench_propagate.cpp
-│   │   ├── bench_sort.cpp
-│   │   └── bench_unshuffle.cpp
-│   ├── graphiti/
-│   │   ├── bench_bfs_mpa.cpp
-│   │   ├── bench_pagerank_mpa.cpp
-│   │   ├── bench_repeat_shuffle.cpp
-│   │   └── graphutils.h
-│   ├── grasp/
-│   │   ├── grasp_pagerank.cpp
-│   │   ├── eval.py
-│   │   ├── parse_results.py
-│   │   ├── Results/
-│   │   └── graphutils.h
-│   ├── utils.cpp
-│   ├── utils.h
-│   └── CMakeLists.txt
-├── test/
-│   └── test_shuffle3p.cpp
+│   │   ├── arith/             # RSS3 offline and online evaluators
+│   │   ├── net/               # Three-party networking
+│   │   └── utils/             # Replicated shares and pairwise PRGs
+│   └── nph/
+│       ├── arith/             # NPH offline and online evaluators
+│       ├── net/               # N-party networking
+│       └── utils/             # Additive shares, PRGs, and preprocessing types
+├── benchmark/primitives/      # Primitive and arithmetic benchmarks
+├── test/                      # Multi-process end-to-end tests
 ├── CMakeLists.txt
 ├── Dockerfile
-├── run.sh
-└── README.md
+└── run.sh
 ```
 
-## Dependencies
+## Requirements
 
-CRiS-MPC requires:
+- A C++17-compatible compiler
+- CMake 3.14 or newer
+- A processor with AES-NI and SSE4.2 support
+- [`emp-tool`](https://github.com/emp-toolkit/emp-tool), installed with its CMake package configuration
+- OpenSSL and GMP, as required by `emp-tool`
+- OpenMP (optional, used when available)
+- Internet access during initial CMake configuration to fetch `nlohmann/json` 3.11.3
 
-- C++17-compatible compiler
-- CMake
-- `emp-tool`
-- `nlohmann_json`
+## Build
 
-
-## Building
-
-From the repository root:
+Install `emp-tool`, then configure and build from the repository root:
 
 ```bash
-mkdir -p build
-cd build
-cmake ..
-cmake --build . -j
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ```
 
-The benchmark binaries are generated under:
+Executables are generated under `build/benchmark/` and `build/test/`.
 
-```text
-build/benchmark/
-```
-
-
-## Running Benchmarks
-
-The repository includes a helper script `run.sh` that launches the three parties locally and saves their outputs.
-
-Run the GraSP RingSG comparison sweeps with:
+If `emp-tool` is installed under a non-standard prefix, pass it to CMake:
 
 ```bash
-python3 benchmark/grasp/eval.py --comparison-ringsg
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_PREFIX_PATH=/path/to/emp-tool/install
 ```
 
-Raw logs are written below `benchmark/grasp/Results/comparison_ringsg/`, and
-the generated comparison tables are written to `benchmark/grasp/Results/Tables/`.
+### Docker
 
-Example:
+The supplied image builds `emp-tool` and CRiS-MPC on Ubuntu 22.04:
 
 ```bash
-./run.sh bench_propagate --vec-size 10 --num-groups 3
+docker build -t cris-mpc .
+docker run --rm -it cris-mpc
 ```
 
-This runs parties `P0`, `P1`, and `P2` locally and stores logs in:
+The image starts a shell in `/workspace`; compiled programs are in `/workspace/build/`.
 
-```text
-Results/bench_propagate/vec_10/groups_3/<timestamp>/
-```
+## Circuit API
 
-Each party’s output is saved separately:
-
-```text
-party_0.log
-party_1.log
-party_2.log
-summary.txt
-```
-
-A custom results directory can be specified using:
-
-```bash
-RESULTS_DIR=./Results/cris_mpc_results ./run.sh bench_propagate --vec-size 10 --num-groups 3
-```
-
-## Available Benchmarks
-
-### `bench_gate`
-
-Benchmarks vectorized basic gates such as addition, multiplication, and
-constant operations.
-
-```bash
-./run.sh bench_gate --gate mul --x 10 --y 20 --vec-size 1000
-```
-
-### `bench_propagate`
-
-Benchmarks the propagate subcircuit, which expands compact group-level values back to a larger list.
-
-```bash
-./run.sh bench_propagate --vec-size 10 --num-groups 3
-```
-
-For the default test layout with `vec-size = 10` and `num-groups = 3`, the benchmark uses three groups of sizes:
-
-```text
-3, 2, 5
-```
-
-and propagates compact group values over the corresponding larger list.
-
-## Adding a New Benchmark
-
-To add a new benchmark, create a file in the `benchmark/` directory.
-
-For example:
-
-```text
-benchmark/primitives/bench_gather.cpp
-```
-
-Then add it to `benchmark/CMakeLists.txt`:
-
-```cmake
-add_3pc_benchmark(bench_gather)
-```
-
-The benchmark helper automatically links the common benchmark dependencies and includes the project root.
-
-## Circuit API Overview
-
-A circuit is built using the `Circuit<T>` class.
-
-Example:
+The following example constructs a vector of multiplications and reconstructs the results:
 
 ```cpp
-Circuit<uint64_t> circ;
+#include "src/common/circuit/circuit.h"
+#include "src/common/protocol_runner.h"
 
-auto x = circ.newInputWire(P0);
-auto y = circ.newInputWire(P1);
+using T = uint64_t;
+using namespace threepc;
 
-auto z = circ.addGate(GateType::kMul, x, y);
+Circuit<T> circuit;
+auto x = circuit.newInputWire(P0);
+auto y = circuit.newInputWire(P1);
+auto product = circuit.addGate(GateType::kMul, x, y);
+auto opened = circuit.addRecGate(product);
+circuit.setAsOutput(opened);
 
-circ.setAsOutput(z);
+auto ordered = circuit.orderGatesByLevel();
 
-auto lc = circ.orderGatesByLevel();
+protocol::ProtocolConfig config;
+config.kind = protocol::ProtocolKind::Rss3;
+config.pid = pid;
+config.num_compute_parties = 3;
+config.peer = "127.0.0.1";
+config.port = 13700;
+
+auto runner = protocol::makeProtocolRunner<T>(config);
+if (pid == P0) runner->setInputs({x}, {T{6}});
+if (pid == P1) runner->setInputs({y}, {T{7}});
+runner->offline(ordered);
+runner->online(ordered);
+auto outputs = runner->getOutputs(ordered);
 ```
 
-The resulting level-ordered circuit can then be evaluated using the offline and online evaluators.
+For NPH, select `ProtocolKind::Nph`, set `num_compute_parties` to at least two, and start one additional process whose PID equals `num_compute_parties`.
 
-## Evaluation Flow
+## GraSP secure graph processing
 
-A typical evaluation follows this structure:
+This repository includes the implementation of **GraSP: Secure Collaborative
+Graph Processing Made Scalable**. GraSP uses a Decompose-Compute-Combine
+paradigm to evaluate message-passing graph algorithms over a graph distributed
+among multiple data owners. The implementation provides PageRank,
+transaction-weighted risk propagation, and bounded-hop group-connection
+detection using the NPH backend.
 
-```cpp
-Net3P net(pid, ips, port);
+Further details are available in [`benchmark/grasp` README](benchmark/grasp/README.md).
 
-OfflineEvaluator<uint64_t> offline(pid, net);
-offline.run(level_ordered_circuit);
+## Arithmetic benchmarks
 
-OnlineEvaluator<uint64_t> eval(pid, net, offline.take_prg());
+The following primitive benchmarks are available:
 
-eval.setInputs(input_wires, input_values);
-eval.evaluate(level_ordered_circuit);
+| Target | Purpose | Protocol support |
+| --- | --- | --- |
+| `bench_gate` | Vectorized add, subtract, multiply, and public-constant gates | RSS3 and NPH |
+| `bench_linear` | Chains of linear arithmetic and secret multiplication | RSS3 and NPH |
+| `bench_mult` | Batched secret multiplication | RSS3 |
 
-auto outputs = eval.getOutputs(level_ordered_circuit);
+`run.sh` launches all required processes locally, records per-process logs, and writes a summary. For example:
+
+```bash
+./run.sh bench_gate \
+  --protocol rss3 \
+  --gate mul --x 10 --y 20 --vec-size 1000
 ```
 
-## Security Model
+Run the same gate using five compute parties and one NPH helper:
 
-CRiS-MPC targets the **semi-honest 3-party setting**.
+```bash
+./run.sh bench_gate \
+  --protocol nph --num-parties 5 \
+  --gate mul --x 10 --y 20 --vec-size 1000
+```
 
-The implementation assumes that all parties follow the protocol specification but may try to learn additional information from their local views.
+For NPH, `--num-parties` counts compute parties only. The launcher starts the helper automatically. The optional `--pking` flag makes P0 reconstruct values and redistribute them to the other compute parties.
 
-The current implementation does not provide malicious-security protections such as MAC verification, sacrifice, or consistency checks.
+Run the linear arithmetic chain through RSS3:
 
-## Notes
+```bash
+./run.sh bench_linear \
+  --protocol rss3 \
+  --vec-size 1000 --chain-depth 10
+```
 
-- The implementation is intended for research and experimental benchmarking.
-- Benchmarks are designed to run three local parties by default.
-- Generated results, logs, and build files should not be committed.
-- If `emp-tool` is installed separately, the local `emp-tool/` directory can be omitted from the repository.
+Or run it with five NPH compute parties and one helper:
+
+```bash
+./run.sh bench_linear \
+  --protocol nph --num-parties 5 \
+  --vec-size 1000 --chain-depth 10
+```
+
+The older `bench_mult` program accepts only RSS3 arguments and currently needs to be launched directly as three processes. For example:
+
+```bash
+build/benchmark/bench_mult --pid 0 --vec-size 1000 &
+build/benchmark/bench_mult --pid 1 --vec-size 1000 &
+build/benchmark/bench_mult --pid 2 --vec-size 1000 &
+wait
+```
+
+All parties must use the same `--port` and `--peer` settings. Start P0 first when launching processes manually.
+
+### Results
+
+By default, `run.sh` stores results under:
+
+```text
+Results/<benchmark>/protocol_<protocol>/parties_<n>/<workload>/<timestamp>/
+├── meta.txt
+├── party_0.log
+├── ...
+└── summary.txt
+```
+
+Set `RESULTS_DIR` to change the base directory:
+
+```bash
+RESULTS_DIR=/tmp/cris-mpc-results ./run.sh bench_gate \
+  --gate add --x 10 --y 20 --vec-size 1000
+```
+
+If `OMP_NUM_THREADS` is unset, the launcher divides the available hardware threads among the processes to avoid local oversubscription.
+
+## Tests
+
+The test programs are multi-process executables; they are built by CMake but are not registered with CTest.
+
+| Target | Coverage | Processes |
+| --- | --- | --- |
+| `test_eqz3p` | RSS3 zero and equality checks | 3 |
+| `test_ltz3p` | RSS3 signed less-than-zero | 3 |
+| `test_eqz_nph` | NPH zero and equality checks | 3 compute + 1 helper |
+| `test_ltz_nph` | NPH LTZ over 8-, 16-, 32-, and 64-bit rings | Configurable compute parties + 1 helper |
+
+To run an RSS3 test locally:
+
+```bash
+build/test/test_eqz3p 0 &
+build/test/test_eqz3p 1 127.0.0.1 &
+build/test/test_eqz3p 2 127.0.0.1 &
+wait
+```
+
+To run the default three-compute-party NPH equality test:
+
+```bash
+build/test/test_eqz_nph 0 &
+build/test/test_eqz_nph 1 127.0.0.1 &
+build/test/test_eqz_nph 2 127.0.0.1 &
+build/test/test_eqz_nph 3 127.0.0.1 &
+wait
+```
+
+Each program prints `PASS` or `FAIL` after reconstructing and checking its outputs. Use distinct ports when running multiple test groups concurrently.
+
+## Security model
+
+CRiS-MPC targets semi-honest adversaries i.e. parties are assumed to follow the protocol but may inspect their local views. The NPH backend assumes a dedicated preprocessing helper and assumes that the helper does not collude with other computing parties. The code is intended for research and experimental benchmarking and has not been independently audited for production use.
 
 ## License
 
-Add your license information here.
+No license is currently provided. All rights remain with the repository owner unless a license is added.

@@ -551,17 +551,21 @@ class OnlineEvaluator {
     if (!pking) {
       // Direct all-to-all reconstruction.
       result = my_shares;
-
-      for (int p = 0; p < num_compute_parties_; ++p) {
-        if (p == pid_) continue;
-        net_.send_ring<T>(my_shares.data(), n, p);
-      }
-      net_.flush();
-
       std::vector<T> buf(n);
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == pid_) continue;
-        net_.recv_ring<T>(buf.data(), n, p);
+
+        // Pairwise ordering prevents every party from blocking in a large
+        // send before anybody starts receiving.
+        if (pid_ < p) {
+          net_.send_ring<T>(my_shares.data(), n, p);
+          net_.flush(p);
+          net_.recv_ring<T>(buf.data(), n, p);
+        } else {
+          net_.recv_ring<T>(buf.data(), n, p);
+          net_.send_ring<T>(my_shares.data(), n, p);
+          net_.flush(p);
+        }
         #pragma omp parallel for if(n >= kParallelInteractiveThreshold) schedule(static)
         for (long long ii = 0; ii < static_cast<long long>(n); ++ii) {
           const size_t i = static_cast<size_t>(ii);
@@ -629,17 +633,21 @@ class OnlineEvaluator {
 
     if (!pking) {
       result = reduced;
-
-      for (int p = 0; p < num_compute_parties_; ++p) {
-        if (p == pid_) continue;
-        net_.send_ring<T>(reduced.data(), n, p);
-      }
-      net_.flush();
-
       std::vector<T> buf(n);
       for (int p = 0; p < num_compute_parties_; ++p) {
         if (p == pid_) continue;
-        net_.recv_ring<T>(buf.data(), n, p);
+
+        // Pairwise ordering prevents every party from waiting to receive
+        // before its peer has sent the corresponding reduced shares.
+        if (pid_ < p) {
+          net_.send_ring<T>(reduced.data(), n, p);
+          net_.flush(p);
+          net_.recv_ring<T>(buf.data(), n, p);
+        } else {
+          net_.recv_ring<T>(buf.data(), n, p);
+          net_.send_ring<T>(reduced.data(), n, p);
+          net_.flush(p);
+        }
         add_mod_into(result, buf);
       }
 

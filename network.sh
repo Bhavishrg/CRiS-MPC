@@ -128,6 +128,111 @@ function tc_nph_pairs() {
     echo "Use the same base port (${base_port}) with run.sh --port."
 }
 
+# Give every NPH process one aggregate bandwidth budget shared by all of its
+# connections. This models a host/NIC limit instead of an independent link
+# limit for every process pair.
+#
+# For the directed socket sender -> receiver, packets sent by the application
+# have the encoded server port as their destination and are charged to the
+# sender. Reverse TCP traffic (ACKs, window updates, etc.) has that port as its
+# source and is charged to the receiver. Consequently all outgoing traffic
+# attributable to one process shares one HTB class and one bandwidth ceiling.
+#
+# NPH's --num-parties excludes the helper, so `tc_nph_parties 5 ...` creates
+# six classes: five compute-party classes and one helper class.
+#
+# Usage:
+#   tc_nph_parties <compute-parties> <base-port> [latency] [bandwidth] [jitter] [correlation]
+#
+# Example:
+#   tc_nph_parties 5 14900 50ms 100Mbit
+#   ./run.sh microbench_graphiti_init --protocol nph --num-parties 5 \
+#       --port 14900 --graph-size 10000
+#
+# The bandwidth argument is the aggregate outgoing limit for each party, not
+# a per-peer limit. This setup matches IPv4 traffic on 127.0.0.1.
+function tc_nph_parties() {
+    local num_compute_parties="${1:-}"
+    local base_port="${2:-}"
+    local latency="${3:-50ms}"
+    local bandwidth="${4:-100Mbit}"
+    local jitter="${5:-3ms}"
+    local correlation="${6:-25%}"
+    local fallback_bandwidth="${TC_FALLBACK_BANDWIDTH:-100Gbit}"
+
+    if ! [[ "${num_compute_parties}" =~ ^[0-9]+$ ]] ||
+       [ "${num_compute_parties}" -lt 2 ]; then
+        echo "tc_nph_parties: compute-parties must be an integer >= 2" >&2
+        return 1
+    fi
+    if ! [[ "${base_port}" =~ ^[0-9]+$ ]] ||
+       [ "${base_port}" -lt 1 ] || [ "${base_port}" -gt 65535 ]; then
+        echo "tc_nph_parties: base-port must be an integer in 1..65535" >&2
+        return 1
+    fi
+
+    local total_processes=$((num_compute_parties + 1))
+    local max_sender=$((total_processes - 1))
+    local max_recv_index=$((total_processes - 2))
+    local max_port=$((base_port + max_sender * 1024 + max_recv_index))
+    if [ "${max_port}" -gt 65535 ]; then
+        echo "tc_nph_parties: NPH port range ends at ${max_port}, above 65535" >&2
+        echo "tc_nph_parties: choose a lower base port or fewer parties" >&2
+        return 1
+    fi
+
+    sudo tc qdisc del dev lo root 2>/dev/null || true
+    sudo tc qdisc add dev lo root handle 1: htb default fff0
+    sudo tc class add dev lo parent 1: classid 1:fff0 htb \
+        rate "${fallback_bandwidth}" ceil "${fallback_bandwidth}"
+
+    local party
+    for ((party = 0; party < total_processes; ++party)); do
+        local class_minor=$((party + 10))
+        local flowid="1:${class_minor}"
+
+        sudo tc class add dev lo parent 1: classid "${flowid}" htb \
+            rate "${bandwidth}" ceil "${bandwidth}"
+        sudo tc qdisc add dev lo parent "${flowid}" handle "${class_minor}:" \
+            netem delay "${latency}" "${jitter}" "${correlation}" \
+            distribution normal
+    done
+
+    local sender
+    local receiver
+    for ((sender = 0; sender < total_processes; ++sender)); do
+        for ((receiver = 0; receiver < total_processes; ++receiver)); do
+            if [ "${sender}" -eq "${receiver}" ]; then
+                continue
+            fi
+
+            local recv_index=$((receiver > sender ? receiver - 1 : receiver))
+            local port=$((base_port + sender * 1024 + recv_index))
+            local sender_flowid="1:$((sender + 10))"
+            local receiver_flowid="1:$((receiver + 10))"
+
+            # Application data on sender -> receiver.
+            sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+                match ip protocol 6 0xff \
+                match ip dport "${port}" 0xffff \
+                flowid "${sender_flowid}"
+
+            # TCP traffic travelling back from receiver to sender.
+            sudo tc filter add dev lo protocol ip parent 1: prio 1 u32 \
+                match ip protocol 6 0xff \
+                match ip sport "${port}" 0xffff \
+                flowid "${receiver_flowid}"
+        done
+    done
+
+    for ((party = 0; party < total_processes; ++party)); do
+        echo "NPH party ${party}: aggregate ${bandwidth}, ${latency}, class 1:$((party + 10))"
+    done
+    echo "Configured ${total_processes} aggregate NPH party classes on lo."
+    echo "Use the same base port (${base_port}) with run.sh --port."
+}
+
+
 # Raise the kernel-wide caps on socket send/receive buffer sizes.
 # setsockopt(SO_SNDBUF/SO_RCVBUF, ...) silently truncates to
 # net.core.wmem_max / net.core.rmem_max, so a large increaseSocketBuffers()

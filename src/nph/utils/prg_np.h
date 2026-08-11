@@ -4,6 +4,8 @@
 
 #include <emp-tool/emp-tool.h>
 
+#include <algorithm>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -103,7 +105,26 @@ class PairwisePRG {
   template <typename T>
   void next(int peer, T* out, size_t count) {
     checkPeer(peer);
-    prgs_[static_cast<size_t>(peer)]->random_data(out, count * sizeof(T));
+    if (count > std::numeric_limits<size_t>::max() / sizeof(T))
+      throw std::overflow_error("PairwisePRG::next: byte count overflow");
+
+    // EMP's PRG takes a signed int byte count.  Large preprocessing batches
+    // can exceed INT_MAX, so feed them to EMP in block-aligned chunks.  Keeping
+    // every non-final chunk AES-block aligned preserves exactly the same PRG
+    // stream as a hypothetical single large call.
+    constexpr size_t kBlockBytes = sizeof(emp::block);
+    constexpr size_t kMaxChunk =
+        (static_cast<size_t>(std::numeric_limits<int>::max()) / kBlockBytes) *
+        kBlockBytes;
+    auto* bytes = reinterpret_cast<unsigned char*>(out);
+    size_t remaining = count * sizeof(T);
+    while (remaining != 0) {
+      const size_t chunk = std::min(remaining, kMaxChunk);
+      prgs_[static_cast<size_t>(peer)]->random_data(
+          bytes, static_cast<int>(chunk));
+      bytes += chunk;
+      remaining -= chunk;
+    }
   }
 
  private:

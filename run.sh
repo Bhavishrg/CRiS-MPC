@@ -27,6 +27,11 @@ if [ $# -lt 1 ]; then
     echo "  - bench_propagate"
     echo "  - bench_unshuffle"
     echo "  - microbench_graphiti_init"
+    echo "  - microbench_InitGraphiti"
+    echo "  - bench_PrMpaGraphiti"
+    echo "  - bench_PrMpaGraSP"
+    echo "  - RiskPropagation"
+    echo "  - GroupConnection"
     echo "  - bench_bfs_mpa"
     echo "  - bench_pagerank_mpa"
     echo "  - bench_dcc_pagerank_mpa"
@@ -256,7 +261,7 @@ case "$BENCHMARK_NAME" in
     bench_sort)
         shape_dir="vec_${vec_size}/bits_${bit_width}"
         ;;
-    microbench_graphiti_init|bench_bfs_mpa|bench_pagerank_mpa|bench_dcc_pagerank_mpa)
+    microbench_graphiti_init|bench_bfs_mpa|bench_pagerank_mpa|bench_dcc_pagerank_mpa|microbench_InitGraphiti|bench_PrMpaGraphiti|bench_PrMpaGraSP|RiskPropagation|GroupConnection)
         if [ "$graph_size" != "unspecified_graph_size" ]; then
             shape_dir="graph_${graph_size}"
         else
@@ -302,6 +307,15 @@ echo ""
 
 declare -a pids
 
+# When benchmark stdout is piped through tee, libc/c++ streams may switch to
+# block buffering and emit logs only at large buffer flushes or process exit.
+# Force line buffering when stdbuf is available so long-running jobs show
+# progress in party logs in near real time.
+STDBUF_CMD=""
+if command -v stdbuf >/dev/null 2>&1; then
+    STDBUF_CMD="stdbuf -oL -eL"
+fi
+
 # All NUM_PROCESSES parties run concurrently on this machine as separate OS
 # processes. Each process's OpenMP runtime defaults to spawning one thread
 # per hardware core (nproc) whenever it hits a parallel region, which causes
@@ -325,10 +339,23 @@ for party in $(seq 0 $((NUM_PROCESSES - 1))); do
     echo "Starting party $party ..."
     echo "  log: $log"
 
-    "$BENCHMARK_PATH" \
-        --pid "$party" \
-        "${BENCHMARK_OPTS[@]}" \
-        2>&1 | tee "$log" &
+    if [ -n "$STDBUF_CMD" ]; then
+        (
+            set -o pipefail
+            $STDBUF_CMD "$BENCHMARK_PATH" \
+                --pid "$party" \
+                "${BENCHMARK_OPTS[@]}" \
+                2>&1 | tee "$log"
+        ) &
+    else
+        (
+            set -o pipefail
+            "$BENCHMARK_PATH" \
+                --pid "$party" \
+                "${BENCHMARK_OPTS[@]}" \
+                2>&1 | tee "$log"
+        ) &
+    fi
 
     pids[$party]=$!
 done

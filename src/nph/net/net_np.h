@@ -245,24 +245,34 @@ class NetNP {
   }
 
  private:
+  struct fd_priority_0 {};
+  struct fd_priority_1 : fd_priority_0 {};
+  struct fd_priority_2 : fd_priority_1 {};
+  struct fd_priority_3 : fd_priority_2 {};
+
   template <typename T>
-  static auto netio_fd_impl(T* io, int) -> decltype(io->consocket, int{}) {
+  static auto netio_fd_impl(T* io, fd_priority_3) -> decltype(io->consocket, int{}) {
     return io->consocket;
   }
 
   template <typename T>
-  static auto netio_fd_impl(T* io, long) -> decltype(io->socket, int{}) {
+  static auto netio_fd_impl(T* io, fd_priority_2) -> decltype(io->socket, int{}) {
     return io->socket;
   }
 
   template <typename T>
-  static int netio_fd_impl(T*, ...) {
+  static auto netio_fd_impl(T* io, fd_priority_1) -> decltype(io->sock, int{}) {
+    return io->sock;
+  }
+
+  template <typename T>
+  static int netio_fd_impl(T*, fd_priority_0) {
     return -1;
   }
 
   static int netio_fd(emp::NetIO* io) {
     if (io == nullptr) return -1;
-    return netio_fd_impl(io, 0);
+    return netio_fd_impl(io, fd_priority_3{});
   }
 
   static int directed_port(int sender, int receiver, int base) {

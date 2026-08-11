@@ -33,9 +33,7 @@
 #include "src/common/circuit/circuit.h"
 #include "src/common/protocol_runner.h"
 
-#include <algorithm>
 #include <cinttypes>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,6 +48,9 @@ using T = uint64_t;
 
 namespace protocol = ::threepc::protocol;
 
+static constexpr size_t kInitializationShuffles = 3;
+static constexpr size_t kShuffleColumns = 3;
+
 struct Args {
     int pid = -1;
 
@@ -63,8 +64,6 @@ struct Args {
     size_t num_vertices = 0;
     size_t num_edges = 0;
     size_t sort_levels = 0;  // zero selects ceil(log2(graph_size))
-    double comparison_factor = 1.0;
-    size_t max_comparisons = 1000000;  // across both synthetic sorts; zero disables
     uint64_t seed = 0x4752415048495449ULL;
 
     int port = 14900;
@@ -77,14 +76,11 @@ static void printUsage(const char* prog) {
         stderr,
         "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
         "(--graph-size <N> | --num-verts <V> --num-edges <E>) "
-        "[--sort-levels <l>] "
-        "[--comparison-factor <f>] [--max-comparisons <m>] [--seed <s>] "
+        "[--sort-levels <l>] [--seed <s>] "
         "[--pking] [--disable-optimized-shuffle] [--port <p>] "
         "[--peer <addr>] [--output <file>]\n\n"
         "If --graph-size N is used, V=N/10 and E=N-V, matching the other "
-        "Graphiti benchmarks.\n"
-        "--comparison-factor must be in (0, 1].  --max-comparisons=0 "
-        "disables the safety cap.\n",
+        "Graphiti benchmarks.\n",
         prog);
 }
 
@@ -107,11 +103,6 @@ static Args parseArgs(int argc, char* argv[]) {
             a.num_edges = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--sort-levels") == 0 && i + 1 < argc) {
             a.sort_levels = static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
-        } else if (std::strcmp(argv[i], "--comparison-factor") == 0 && i + 1 < argc) {
-            a.comparison_factor = std::strtod(argv[++i], nullptr);
-        } else if (std::strcmp(argv[i], "--max-comparisons") == 0 && i + 1 < argc) {
-            a.max_comparisons =
-                static_cast<size_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
             a.seed = static_cast<uint64_t>(std::strtoull(argv[++i], nullptr, 10));
         } else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) {
@@ -149,8 +140,7 @@ static Args parseArgs(int argc, char* argv[]) {
     }
 
     if (!pid_ok || a.graph_size == 0 || a.num_vertices == 0 ||
-        a.num_vertices + a.num_edges != a.graph_size ||
-        !(a.comparison_factor > 0.0 && a.comparison_factor <= 1.0)) {
+        a.num_vertices + a.num_edges != a.graph_size) {
         printUsage(argv[0]);
         std::exit(1);
     }
@@ -192,83 +182,6 @@ static std::vector<size_t> balancedComparisonCounts(size_t n, size_t levels) {
         partitions = partitions > n / 2 ? n : partitions * 2;
     }
     return counts;
-}
-
-static std::vector<size_t> scaleComparisonCounts(
-    const std::vector<size_t>& full,
-    double factor) {
-    if (factor == 1.0) return full;
-
-    std::vector<size_t> scaled(full.size(), 0);
-    for (size_t i = 0; i < full.size(); ++i) {
-        if (full[i] == 0) continue;
-        const long double value =
-            static_cast<long double>(full[i]) * static_cast<long double>(factor);
-        scaled[i] = std::max<size_t>(1, static_cast<size_t>(std::ceil(value)));
-    }
-    return scaled;
-}
-
-// Reduce a per-level gate model while retaining at least one comparison in
-// every active quicksort depth whenever the cap is large enough.  The remaining
-// budget is assigned proportionally to the uncapped per-level counts.
-static std::vector<size_t> capComparisonCounts(
-    const std::vector<size_t>& requested,
-    size_t cap) {
-    const size_t total = sumCounts(requested);
-    if (total <= cap) return requested;
-    if (cap == 0) return std::vector<size_t>(requested.size(), 0);
-
-    std::vector<size_t> selected(requested.size(), 0);
-    std::vector<size_t> active;
-    for (size_t i = 0; i < requested.size(); ++i) {
-        if (requested[i] != 0) active.push_back(i);
-    }
-
-    if (cap < active.size()) {
-        // There is not enough budget to represent every level. Prefer the
-        // deepest levels so the reported circuit still includes late-stage
-        // comparisons, while accurately reporting that levels were omitted.
-        for (size_t i = 0; i < cap; ++i) {
-            selected[active[active.size() - 1 - i]] = 1;
-        }
-        return selected;
-    }
-
-    for (size_t i : active) selected[i] = 1;
-    size_t remaining = cap - active.size();
-    if (remaining == 0) return selected;
-
-    const size_t residual_total = total - active.size();
-    if (residual_total == 0) return selected;
-
-    struct Fraction {
-        long double value;
-        size_t level;
-    };
-    std::vector<Fraction> fractions;
-    fractions.reserve(active.size());
-
-    size_t assigned = 0;
-    for (size_t i : active) {
-        const size_t weight = requested[i] - 1;
-        const long double exact = static_cast<long double>(remaining) *
-                                  static_cast<long double>(weight) /
-                                  static_cast<long double>(residual_total);
-        const size_t whole = static_cast<size_t>(std::floor(exact));
-        selected[i] += whole;
-        assigned += whole;
-        fractions.push_back({exact - static_cast<long double>(whole), i});
-    }
-
-    std::sort(fractions.begin(), fractions.end(),
-              [](const Fraction& lhs, const Fraction& rhs) {
-                  return lhs.value > rhs.value;
-              });
-    for (size_t i = 0; i < remaining - assigned; ++i) {
-        ++selected[fractions[i].level];
-    }
-    return selected;
 }
 
 struct SortBuildResult {
@@ -371,11 +284,25 @@ static std::vector<std::vector<wire_t>> anchorColumns(
     return anchored;
 }
 
+// An initialization shuffle consists of one grouped kShuffle gate for each
+// aligned column.  Sharing the permutation-group id preserves row alignment
+// while retaining the protocol cost of shuffling every column.
+static std::vector<std::vector<wire_t>> addInitializationShuffle(
+    Circuit<T>& circuit,
+    const std::vector<std::vector<wire_t>>& columns) {
+    if (columns.size() != kShuffleColumns) {
+        throw std::invalid_argument(
+            "initialization shuffle requires source key, destination key, and index");
+    }
+
+    const int permutation_group = circuit.freshPermGroupId();
+    return circuit.addSubCircShuffleWithPayload(columns, permutation_group);
+}
+
 struct CircuitData {
     LevelOrderedCircuit lc;
     std::vector<wire_t> input_wires;
     std::vector<size_t> full_counts;
-    std::vector<size_t> scaled_counts;
     std::vector<size_t> source_counts;
     std::vector<size_t> destination_counts;
     size_t source_comparisons = 0;
@@ -431,23 +358,11 @@ static CircuitData generateCircuit(const Args& args) {
                               ? natural_levels
                               : std::min(args.sort_levels, natural_levels);
     data.full_counts = balancedComparisonCounts(n, levels);
-    data.scaled_counts =
-        scaleComparisonCounts(data.full_counts, args.comparison_factor);
-
-    const size_t scaled_per_sort = sumCounts(data.scaled_counts);
-    if (args.max_comparisons == 0 || scaled_per_sort <= args.max_comparisons / 2) {
-        data.source_counts = data.scaled_counts;
-        data.destination_counts = data.scaled_counts;
-    } else {
-        const size_t source_budget = (args.max_comparisons + 1) / 2;
-        const size_t destination_budget = args.max_comparisons / 2;
-        data.source_counts = capComparisonCounts(data.scaled_counts, source_budget);
-        data.destination_counts =
-            capComparisonCounts(data.scaled_counts, destination_budget);
-    }
+    data.source_counts = data.full_counts;
+    data.destination_counts = data.full_counts;
 
     // Shuffle A maps vertex order to a hidden intermediate order.
-    columns = circuit.addSubCircShuffleWithPayload(columns);
+    columns = addInitializationShuffle(circuit, columns);
 
     // Source-order insecure sort model. Column 0 is the source key and column 2
     // is the index array returned as a public permutation.
@@ -461,7 +376,7 @@ static CircuitData generateCircuit(const Args& args) {
     // Shuffle B cannot start before the public source sort finishes. Adding a
     // shared/public zero keeps row values unchanged while encoding dependency.
     columns = anchorColumns(circuit, columns, source_sort.anchor);
-    columns = circuit.addSubCircShuffleWithPayload(columns);
+    columns = addInitializationShuffle(circuit, columns);
 
     // Destination-order insecure sort model. Again, only the index array is
     // conceptually reordered and opened as the public permutation.
@@ -475,12 +390,18 @@ static CircuitData generateCircuit(const Args& args) {
     // Shuffle C returns to a hidden vertex order and is serialized after the
     // destination sort in the same way.
     columns = anchorColumns(circuit, columns, destination_sort.anchor);
-    columns = circuit.addSubCircShuffleWithPayload(columns);
+    columns = addInitializationShuffle(circuit, columns);
 
     // Keep the terminal secure-shuffle output live. The public permutation
     // outputs themselves are the reconstructed index arrays above.
     circuit.setAsOutput(columns[2][0]);
     data.lc = circuit.orderGatesByLevel();
+    const size_t required_shuffle_gates =
+        kInitializationShuffles * kShuffleColumns;
+    if (data.lc.count[static_cast<size_t>(GateType::kShuffle)] !=
+        required_shuffle_gates) {
+        throw std::logic_error("initialization circuit has an unexpected shuffle count");
+    }
     return data;
 }
 
@@ -530,12 +451,6 @@ static void benchmark(const Args& args) {
     std::printf("  num_edges         : %zu\n", args.num_edges);
     std::printf("  sort_levels       : %zu (natural: %zu)\n",
                 effective_levels, natural_levels);
-    std::printf("  comparison_factor : %.6f\n", args.comparison_factor);
-    if (args.max_comparisons == 0) {
-        std::printf("  comparison_cap    : disabled\n");
-    } else {
-        std::printf("  comparison_cap    : %zu total\n", args.max_comparisons);
-    }
     std::printf("  pking             : %s\n", args.pking ? "true" : "false");
     std::printf("  opt_shuffle       : %s\n",
                 args.disable_optimized_shuffle ? "disabled" : "enabled");
@@ -547,23 +462,19 @@ static void benchmark(const Args& args) {
     const double build_time_ms = build_end - build_start;
 
     const size_t full_per_sort = sumCounts(data.full_counts);
-    const size_t scaled_per_sort = sumCounts(data.scaled_counts);
     const size_t total_comparisons =
         data.source_comparisons + data.destination_comparisons;
-    const bool truncated = total_comparisons < 2 * scaled_per_sort;
 
-    std::printf("[P%d] Model: %zu full comparisons/sort, "
-                "%zu scaled comparisons/sort\n",
-                args.pid, full_per_sort, scaled_per_sort);
+    std::printf("[P%d] Model: %zu comparisons/sort\n",
+                args.pid, full_per_sort);
     std::printf("[P%d] Instantiated: source=%zu (%zu active levels), "
-                "destination=%zu (%zu active levels), total=%zu%s\n",
+                "destination=%zu (%zu active levels), total=%zu\n",
                 args.pid,
                 data.source_comparisons,
                 data.source_active_levels,
                 data.destination_comparisons,
                 data.destination_active_levels,
-                total_comparisons,
-                truncated ? " [CAPPED]" : "");
+                total_comparisons);
     std::printf("[P%d] Circuit: %zu gates, %zu wires, depth %zu; build %.3f ms\n",
                 args.pid,
                 data.lc.num_gates,
@@ -646,8 +557,6 @@ static void benchmark(const Args& args) {
         {"num_edges", args.num_edges},
         {"natural_sort_levels", natural_levels},
         {"effective_sort_levels", effective_levels},
-        {"comparison_factor", args.comparison_factor},
-        {"max_comparisons", args.max_comparisons},
         {"seed", args.seed},
         {"pking", args.pking},
         {"optimized_shuffle_disabled", args.disable_optimized_shuffle},
@@ -655,20 +564,19 @@ static void benchmark(const Args& args) {
         {"peer", args.peer}
     };
     output_doc["model"] = {
-        {"secure_shuffles", 3},
-        {"shuffle_arrays", 3},
-        {"shuffle_payload_elements", 9 * args.graph_size},
+        {"secure_shuffles", kInitializationShuffles},
+        {"shuffle_arrays", kShuffleColumns},
+        {"shuffle_payload_elements",
+         kInitializationShuffles * kShuffleColumns * args.graph_size},
         {"public_index_outputs", 2 * args.graph_size},
         {"source_key", "2*source + (1-isV)"},
         {"destination_key", "2*destination + isV"},
         {"full_comparisons_per_sort", full_per_sort},
-        {"scaled_comparisons_per_sort", scaled_per_sort},
         {"source_comparisons", data.source_comparisons},
         {"destination_comparisons", data.destination_comparisons},
         {"source_active_levels", data.source_active_levels},
         {"destination_active_levels", data.destination_active_levels},
-        {"comparisons_total", total_comparisons},
-        {"truncated_by_cap", truncated}
+        {"comparisons_total", total_comparisons}
     };
     output_doc["circuit"] = {
         {"build_time_ms", build_time_ms},

@@ -1,6 +1,6 @@
 // bench_linear.cpp
 //
-// Benchmark for straight-line arithmetic computations in the 3PC RSS framework.
+// Benchmark for straight-line arithmetic computations using RSS3 or NPH.
 //
 // This benchmark exercises:
 //   - kAdd
@@ -11,7 +11,10 @@
 //   - kCMul
 //
 // Options:
-//   --pid          <0|1|2>   Party ID
+//   --pid          <pid>     Process ID
+//   --protocol     <name>    rss3 (default) or nph
+//   --num-parties  <N>       Number of compute parties
+//   --pking                  NPH reconstruction through P0
 //   --vec-size     <N>       Number of independent lanes
 //   --chain-depth  <D>       Number of arithmetic rounds per lane
 //   --port         <int>     Base port
@@ -31,8 +34,7 @@
 //     d = c * y
 //     e = d * const
 //     f = e - const
-//     g = const - f
-//     state = g + state
+//     state = f + state
 //
 //   output = state
 //
@@ -40,10 +42,8 @@
 //   x is owned by P0.
 //   y is owned by P1.
 
-#include "src/3pc/arith/offline_evaluator.h"
-#include "src/3pc/arith/online_evaluator.h"
 #include "src/common/circuit/circuit.h"
-#include "src/3pc/net/net3p.h"
+#include "src/common/protocol_runner.h"
 #include "benchmark/utils.h"
 
 #include <algorithm>
@@ -90,7 +90,6 @@ CircuitData generateCircuit(size_t n, size_t chain_depth) {
             const T c_add = static_cast<T>(r + 5);
             const T c_mul = static_cast<T>(r + 2);
             const T c_sub = static_cast<T>(r + 3);
-            const T c_inv = static_cast<T>(1000 + r);
 
             // a = state + y
             wire_t a = c.addGate(GateType::kAdd, state, cd.in1[i]);
@@ -137,7 +136,6 @@ static std::vector<T> computeExpected(const std::vector<T>& in0,
             const T c_add = static_cast<T>(r + 5);
             const T c_mul = static_cast<T>(r + 2);
             const T c_sub = static_cast<T>(r + 3);
-            const T c_inv = static_cast<T>(1000 + r);
 
             T a = state + in1[i];
             T b = a + c_add;
@@ -159,6 +157,12 @@ static std::vector<T> computeExpected(const std::vector<T>& in0,
 
 struct Args {
     int pid = -1;
+
+    std::string protocol_name = "rss3";
+    protocol::ProtocolKind protocol = protocol::ProtocolKind::Rss3;
+    int num_parties = 3;  // compute parties; NPH has one extra helper process
+    bool pking = false;
+
     size_t vec_size = 0;
     size_t chain_depth = 1;
     int port = 13800;
@@ -169,9 +173,14 @@ struct Args {
 
 static void printUsage(const char* prog) {
     std::fprintf(stderr,
-        "Usage: %s --pid <0|1|2> --vec-size <N> "
+        "Usage: %s --pid <pid> --protocol <rss3|nph> --num-parties <n> "
+        "--vec-size <N> "
         "[--chain-depth <D>] [--port <p>] [--peer <addr>] "
-        "[--repeat <r>] [--output <file>]\n",
+        "[--pking] [--repeat <r>] [--output <file>]\n\n"
+        "Protocols:\n"
+        "  rss3: --num-parties must be 3, pids 0..2\n"
+        "  nph : --num-parties is the number of compute parties, helper pid is n\n"
+        "        --pking enables two-round reconstruction through P0\n",
         prog);
 }
 
@@ -181,6 +190,11 @@ static Args parseArgs(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             a.pid = std::atoi(argv[++i]);
+        } else if (std::strcmp(argv[i], "--protocol") == 0 && i + 1 < argc) {
+            a.protocol_name = argv[++i];
+            a.protocol = protocol::parseProtocolKind(a.protocol_name);
+        } else if (std::strcmp(argv[i], "--num-parties") == 0 && i + 1 < argc) {
+            a.num_parties = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--vec-size") == 0 && i + 1 < argc) {
             a.vec_size = static_cast<size_t>(std::atoll(argv[++i]));
         } else if (std::strcmp(argv[i], "--chain-depth") == 0 && i + 1 < argc) {
@@ -189,19 +203,27 @@ static Args parseArgs(int argc, char* argv[]) {
             a.port = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--peer") == 0 && i + 1 < argc) {
             a.peer = argv[++i];
+        } else if (std::strcmp(argv[i], "--pking") == 0) {
+            a.pking = true;
         } else if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) {
             a.repeat = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--output") == 0 && i + 1 < argc) {
             a.output = argv[++i];
         } else {
-            std::fprintf(stderr, "Unknown argument: %s\n", argv[i]);
+            std::fprintf(stderr, "Unknown or incomplete argument: %s\n", argv[i]);
             printUsage(argv[0]);
             std::exit(1);
         }
     }
 
-    if (a.pid < 0 || a.pid > 2 ||
-        a.vec_size == 0 ||
+    bool pid_ok = false;
+    if (a.protocol == protocol::ProtocolKind::Rss3) {
+        pid_ok = (a.pid >= 0 && a.pid < 3 && a.num_parties == 3);
+    } else if (a.protocol == protocol::ProtocolKind::Nph) {
+        pid_ok = (a.num_parties >= 2 && a.pid >= 0 && a.pid <= a.num_parties);
+    }
+
+    if (!pid_ok || a.vec_size == 0 ||
         a.chain_depth == 0 ||
         a.repeat <= 0) {
         printUsage(argv[0]);
@@ -236,14 +258,25 @@ static void printVector(const char* label,
 // ── Benchmark ─────────────────────────────────────────────────────────────────
 
 static void benchmark(const Args& args) {
-    using SP = bench::StatsPoint<Net3P>;
+    using Runner = protocol::IProtocolRunner<T>;
+    using SP = bench::StatsPoint<Runner>;
 
     const int pid = args.pid;
     const size_t n = args.vec_size;
     const size_t chain_depth = args.chain_depth;
+    const bool is_helper =
+        args.protocol == protocol::ProtocolKind::Nph &&
+        pid == args.num_parties;
 
     std::printf("\n=== bench_linear ===\n");
-    std::printf("  pid         : %d\n", pid);
+    std::printf("  protocol    : %s\n", protocol::protocolName(args.protocol));
+    std::printf("  num_parties : %d%s\n",
+                args.num_parties,
+                args.protocol == protocol::ProtocolKind::Nph
+                    ? " compute parties + 1 helper"
+                    : "");
+    std::printf("  pking       : %s\n", args.pking ? "true" : "false");
+    std::printf("  pid         : %d%s\n", pid, is_helper ? " (helper)" : "");
     std::printf("  vec_size    : %zu\n", n);
     std::printf("  chain_depth : %zu\n", chain_depth);
     std::printf("  port        : %d\n", args.port);
@@ -275,22 +308,16 @@ static void benchmark(const Args& args) {
         printVector("expected", pid, expected);
     }
 
-    // ── Network ───────────────────────────────────────────────────────────────
-
-    const char* peer_c = args.peer.c_str();
-    const char* ips[3] = {peer_c, peer_c, peer_c};
-
-    std::printf("\n[P%d] Connecting...\n", pid);
-    Net3P net(pid, ips, args.port);
-    std::printf("[P%d] Connected.\n\n", pid);
-
-    bench::increaseSocketBuffers(net, 128 * 1024 * 1024);
-
     // ── JSON accumulator ──────────────────────────────────────────────────────
 
     nlohmann::json output_doc;
     output_doc["details"] = {
+        {"benchmark", "bench_linear"},
+        {"protocol", protocol::protocolName(args.protocol)},
+        {"num_compute_parties", args.num_parties},
+        {"pking", args.pking},
         {"pid", pid},
+        {"is_helper", is_helper},
         {"vec_size", n},
         {"chain_depth", chain_depth},
         {"port", args.port},
@@ -307,45 +334,51 @@ static void benchmark(const Args& args) {
                         pid, run + 1, args.repeat);
         }
 
-        net.resetCounters();
+        protocol::ProtocolConfig pcfg;
+        pcfg.kind = args.protocol;
+        pcfg.pid = args.pid;
+        pcfg.num_compute_parties = args.num_parties;
+        pcfg.port = args.port;
+        pcfg.peer = args.peer;
+        pcfg.pking = args.pking;
+
+        std::printf("[P%d] Connecting...\n", pid);
+        auto runner = protocol::makeProtocolRunner<T>(pcfg);
+        std::printf("[P%d] Connected.\n", pid);
+
+        bench::increaseSocketBuffers(*runner, 128 * 1024 * 1024);
+
+        if (!runner->isHelper() && pid == P0) {
+            runner->setInputs(cd.in0, vals0);
+        }
+        if (!runner->isHelper() && pid == P1) {
+            runner->setInputs(cd.in1, vals1);
+        }
+
+        runner->resetCounters();
 
         // Offline
         std::printf("[P%d] Offline...\n", pid);
-        SP offline_start(net);
-
-        OfflineEvaluator<T> offline(pid, net);
-        offline.run(lc);
-
-        SP offline_end(net);
+        SP offline_start(*runner);
+        runner->offline(lc);
+        SP offline_end(*runner);
         auto offline_stats = offline_end - offline_start;
 
         // Online
         std::printf("[P%d] Online...\n", pid);
-        OnlineEvaluator<T> ev(pid, net, offline.take_prg());
-
-        if (pid == P0) {
-            ev.setInputs(cd.in0, vals0);
-        }
-
-        if (pid == P1) {
-            ev.setInputs(cd.in1, vals1);
-        }
-
-        SP online_start(net);
-
-        ev.evaluate(lc);
-        auto outputs = ev.getOutputs(lc);
-
-        SP online_end(net);
+        SP online_start(*runner);
+        runner->online(lc);
+        auto out = runner->getOutputs(lc);
+        SP online_end(*runner);
         auto online_stats = online_end - online_start;
-
-        const std::vector<T>& out = outputs.vals;
 
         // ── Correctness ───────────────────────────────────────────────────────
 
-        bool ok = (out.size() == expected.size());
-
-        if (ok) {
+        bool ok = true;
+        if (!runner->isHelper()) {
+            ok = (out.size() == expected.size());
+        }
+        if (!runner->isHelper() && ok) {
             for (size_t i = 0; i < n; ++i) {
                 if (out[i] != expected[i]) {
                     ok = false;
@@ -354,10 +387,12 @@ static void benchmark(const Args& args) {
             }
         }
 
-        std::printf("[P%d] Linear arithmetic correctness: %s\n",
-                    pid, ok ? "PASS" : "FAIL");
+        std::printf("[P%d] Linear arithmetic correctness: %s%s\n",
+                    pid,
+                    runner->isHelper() ? "SKIP" : (ok ? "PASS" : "FAIL"),
+                    runner->isHelper() ? " (helper has no outputs)" : "");
 
-        if (!ok || n <= 20) {
+        if (!runner->isHelper() && (!ok || n <= 20)) {
             printVector("output", pid, out);
         }
 
@@ -388,7 +423,8 @@ static void benchmark(const Args& args) {
 
         output_doc["runs"].push_back({
             {"run", run + 1},
-            {"correct", ok},
+            {"correct", runner->isHelper() ? true : ok},
+            {"helper_skip", runner->isHelper()},
             {"offline", offline_stats},
             {"online", online_stats},
             {"total", total_stats}
