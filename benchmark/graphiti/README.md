@@ -2,10 +2,11 @@
 
 This directory contains the implementation of **Graphiti: Secure Graph Computation Made More Scalable**. See [IACR ePrint 2024/1756](https://eprint.iacr.org/2024/1756). It includes secure BFS and PageRank computation, shuffle protocol benchmarks, and a microbenchmark for Graphiti's initialization. The code is intended for research and experimental comparison.
 
+
 ## Implementations
 
 
-### `bench_bfs_mpa`
+### `bench_BfsMpaGraphiti`
 
 This benchmark implements bounded-hop breadth-first search over the secret-shared graph list.
 
@@ -14,7 +15,7 @@ Program options:
 - `--graph-size N`: Vertices + Edges
 - `--num-hops H`: number of BFS expansion rounds; default `10`
 - `--source-vertex V`: public source vertex; default `0`
-- `--skip-final-applyv`: leave the raw count-oriented result instead of applying the final vertex ordering
+- `--skip-final-applyv`: return raw counts instead of converting them to reachability bits; skips the reference correctness check
 - `--no-check`: disable cleartext validation
 - `--seed S`: deterministic graph seed
 
@@ -29,11 +30,11 @@ Use `--num-verts V --num-edges E` when an explicit split is required.
 
 Correctness checking is skipped for sufficiently large graphs.
 
-### `bench_pagerank_mpa`
+### `bench_PrMpaGraphiti`
 
 This benchmark implements PageRank computation using message passing.
 
-The current benchmark uses `alpha = 1` and a secret-shared `rho = 1`.
+The current benchmark uses `alpha = 1` and a secret-shared `rho = 1`. Its recurrence sums incoming values at each vertex over the ring, starting from vertex values of one. It does not implement conventional normalized, damped PageRank.
 
 Program options:
 
@@ -43,7 +44,7 @@ Program options:
 
 Correctness checking is skipped for large graphs.
 
-### `bench_repeat_shuffle`
+### `bench_shuffle`
 
 This benchmark sequentially applies the same random permutation to a vector using secure shuffle.
 
@@ -52,7 +53,7 @@ Program options:
 - `--vec-size N`: number of elements
 - `--num-repeats R`: number of shuffle applications
 
-### `microbench_graphiti_init`
+### `microbench_InitGraphiti`
 
 This benchmark builds a synthetic circuit that models Graphiti initialization, including three aligned-column shuffles and source/destination sorts. Each sort instantiates the full balanced quicksort comparison model at its natural depth, $\lceil\log_2(N)\rceil$. Comparisons at the same depth are evaluated in parallel, while consecutive depths and initialization stages retain their communication dependencies.
 
@@ -61,6 +62,8 @@ Program options:
 - `--graph-size N`: total number of vertex and edge rows, using the standard `N/10` vertex split
 - `--num-verts V --num-edges E`: explicit graph dimensions
 - `--seed S`: deterministic graph seed
+
+The model does not implement data-dependent partitioning or swaps, so it does not perform a complete sort or produce valid sorted graph orders.
 
 The number of modeled comparisons grows as $O(N\log N)$, and each comparison creates LTZ and reconstruction gates. Large graph sizes can therefore require substantial circuit-construction time, memory, preprocessing, and communication.
 
@@ -76,10 +79,10 @@ cmake --build build --parallel
 The resulting programs are:
 
 ```text
-build/benchmark/bench_bfs_mpa
-build/benchmark/bench_pagerank_mpa
-build/benchmark/bench_repeat_shuffle
-build/benchmark/microbench_graphiti_init
+build/benchmark/bench_BfsMpaGraphiti
+build/benchmark/bench_PrMpaGraphiti
+build/benchmark/bench_shuffle
+build/benchmark/microbench_InitGraphiti
 ```
 
 See the root `README.md` for dependencies and protocol details.
@@ -93,7 +96,7 @@ Run commands from the repository root. `run.sh` starts all processes locally, ad
 Run BFS with two NPH compute parties and one helper:
 
 ```bash
-./run.sh bench_bfs_mpa \
+./run.sh bench_BfsMpaGraphiti \
   --protocol nph --num-parties 2 \
   --graph-size 10000 --num-hops 10 --source-vertex 0
 ```
@@ -101,7 +104,7 @@ Run BFS with two NPH compute parties and one helper:
 Run the same workload with explicit graph dimensions:
 
 ```bash
-./run.sh bench_bfs_mpa \
+./run.sh bench_BfsMpaGraphiti \
   --protocol nph --num-parties 3 \
   --num-verts 1000 --num-edges 9000 \
   --num-hops 10 --source-vertex 5
@@ -110,15 +113,15 @@ Run the same workload with explicit graph dimensions:
 ### PageRank
 
 ```bash
-./run.sh bench_pagerank_mpa \
+./run.sh bench_PrMpaGraphiti \
   --protocol nph --num-parties 2 \
   --graph-size 10000 --num-iters 10
 ```
 
-RSS3 is also supported by the BFS and PageRank implementations:
+RSS3 is supported by PageRank. The BFS argument parser currently requires `--skip-final-applyv` with RSS3, so that mode returns raw counts and skips the reachability check:
 
 ```bash
-./run.sh bench_pagerank_mpa \
+./run.sh bench_PrMpaGraphiti \
   --protocol rss3 --num-parties 3 \
   --graph-size 10000 --num-iters 10
 ```
@@ -126,7 +129,7 @@ RSS3 is also supported by the BFS and PageRank implementations:
 ### Repeated shuffle
 
 ```bash
-./run.sh bench_repeat_shuffle \
+./run.sh bench_shuffle \
   --protocol nph --num-parties 2 \
   --vec-size 10000 --num-repeats 10
 ```
@@ -134,7 +137,7 @@ RSS3 is also supported by the BFS and PageRank implementations:
 ### Initialization microbenchmark
 
 ```bash
-./run.sh microbench_graphiti_init \
+./run.sh microbench_InitGraphiti \
   --protocol nph --num-parties 2 \
   --graph-size 10000
 ```
@@ -160,27 +163,25 @@ For NPH, compute-party PIDs are `0..N-1` and the preprocessing helper PID is `N`
 By default, runs are stored under:
 
 ```text
-Results/<benchmark>/protocol_<protocol>/parties_<n>/<graph-shape>/<timestamp>/
+Results/<benchmark>/protocol_<protocol>/parties_<n>/<workload>/<timestamp>/
 ├── meta.txt
 ├── party_0.log
 ├── ...
 └── summary.txt
 ```
 
-For example, explicit graph dimensions produce:
+For example, PageRank with explicit graph dimensions produces:
 
 ```text
-Results/bench_bfs_mpa/protocol_nph/parties_2/verts_1000/edges_9000/<timestamp>/
+Results/bench_PrMpaGraphiti/protocol_nph/parties_2/verts_1000/edges_9000/<timestamp>/
 ```
 
 Override the base directory with `RESULTS_DIR`:
 
 ```bash
-RESULTS_DIR=/tmp/graphiti-results ./run.sh bench_pagerank_mpa \
+RESULTS_DIR=/tmp/graphiti-results ./run.sh bench_PrMpaGraphiti \
   --protocol nph --num-parties 2 --graph-size 10000
 ```
-
-The logs report circuit size and depth, phase runtimes, bytes sent and received, peak memory, and correctness status.
 
 ## Network emulation
 
@@ -197,7 +198,7 @@ For an NPH run, independent bandwidth and latency can be assigned to every unord
 source network.sh
 tc_nph_pairs 2 14900 50ms 100Mbit
 
-./run.sh bench_pagerank_mpa \
+./run.sh bench_PrMpaGraphiti \
   --protocol nph --num-parties 2 --port 14900 \
   --graph-size 10000 --num-iters 10
 ```

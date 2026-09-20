@@ -1,6 +1,11 @@
 # CRiS-MPC
 
-CRiS-MPC is a C++17 framework for semi-honest secure multiparty computation over rings of the form $\mathbb{Z}_{2^k}$. It provides a circuit-building API, offline and online evaluators, and two protocol backends for research and benchmarking.
+CRiS-MPC implements graph-processing protocols and benchmarks from:
+
+- [Graphiti: Secure Graph Computation Made More Scalable](https://eprint.iacr.org/2024/1756).
+- [GraSP: Secure Collaborative Graph Processing Made Scalable](https://eprint.iacr.org/2025/590).
+
+Both use a shared C++17 framework for semi-honest secure multiparty computation over rings of the form $\mathbb{Z}_{2^k}$. The framework provides a circuit-building API, offline preprocessing, online evaluation, and two protocol backends. This repository is research and benchmarking code; the implementation scope and benchmark simplifications are described below.
 
 ## Protocols
 
@@ -9,7 +14,7 @@ CRiS-MPC is a C++17 framework for semi-honest secure multiparty computation over
 | `rss3` | Three-party replicated secret sharing | Three compute parties, with PIDs `0`, `1`, and `2` |
 | `nph` | N-party additive sharing | `n` compute parties with PIDs `0..n-1`, plus a preprocessing helper with PID `n` |
 
-## Arithmetic primitives
+## Circuit primitives
 
 The circuit API provides:
 
@@ -21,6 +26,9 @@ The circuit API provides:
 - Signed less-than-zero comparison
 - Reconstruction to all parties
 - Reconstruction to one selected party
+- Grouped shuffle and inverse shuffle
+- Permute+Share and NPH amortized Permute+Share
+- Local permutation and Propagate/Gather subcircuits
 
 Arithmetic is performed using native unsigned 8-, 16-, 32-, or 64-bit types. Overflow implements reduction modulo $2^k$. Signed comparison interprets the most significant bit using two's-complement representation.
 
@@ -41,11 +49,15 @@ CRiS-MPC/
 │       ├── arith/             # NPH offline and online evaluators
 │       ├── net/               # N-party networking
 │       └── utils/             # Additive shares, PRGs, and preprocessing types
-├── benchmark/primitives/      # Primitive and arithmetic benchmarks
+├── benchmark/
+│   ├── primitives/           # Arithmetic, sort, and permutation benchmarks
+│   ├── graphiti/             # BFS, PageRank, shuffle, initialization model
+│   └── grasp/                # DCC applications, eval.py, parse_results.py
 ├── test/                      # Multi-process end-to-end tests
 ├── CMakeLists.txt
 ├── Dockerfile
-└── run.sh
+├── network.sh                # Network emulation for experiments
+└── run.sh                    # Local multiprocess benchmark launcher
 ```
 
 ## Requirements
@@ -125,16 +137,29 @@ auto outputs = runner->getOutputs(ordered);
 
 For NPH, select `ProtocolKind::Nph`, set `num_compute_parties` to at least two, and start one additional process whose PID equals `num_compute_parties`.
 
-## GraSP secure graph processing
+## Graph computation: implementation status
 
-This repository includes the implementation of **GraSP: Secure Collaborative
-Graph Processing Made Scalable**. GraSP uses a Decompose-Compute-Combine
-paradigm to evaluate message-passing graph algorithms over a graph distributed
-among multiple data owners. The implementation provides PageRank,
-transaction-weighted risk propagation, and bounded-hop group-connection
-detection using the NPH backend.
+Graphiti uses shuffle-based order transitions with Propagate and Gather subcircuits. GraSP uses Decompose-Compute-Combine (DCC), Permute+Share, and amortized Permute+Share to evaluate party-specific subgraphs and combine their results.
 
-Further details are available in [`benchmark/grasp` README](benchmark/grasp/README.md).
+| Component | CMake target | Current scope |
+| --- | --- | --- |
+| Graphiti BFS | `bench_BfsMpaGraphiti` | Bounded-hop message passing; NPH, or RSS3 with `--skip-final-applyv` |
+| Graphiti PageRank | `bench_PrMpaGraphiti` | Simplified PageRank workload; RSS3 and NPH |
+| Graphiti shuffle | `bench_shuffle` | Repeated grouped shuffle; RSS3 and NPH |
+| Graphiti initialization | `microbench_InitGraphiti` | Synthetic shuffle/sort cost model; RSS3 and NPH |
+| GraSP PageRank | `bench_PrMpaGraSP` | DCC with simplified PageRank workload; NPH |
+| GraSP risk propagation | `RiskPropagation` | Transaction-weighted risk propagation; NPH |
+| GraSP group connection | `GroupConnection` | Bounded-hop connection detection; NPH |
+
+
+For commands and details, see the [Graphiti README](benchmark/graphiti/README.md) and [GraSP README](benchmark/grasp/README.md). The GraSP directory also contains evaluation sweeps and result-table generation.
+
+For example, after building:
+
+```bash
+./run.sh bench_PrMpaGraphiti --protocol nph --num-parties 2 --graph-size 10000 --num-iters 10
+./run.sh bench_PrMpaGraSP --protocol nph --num-parties 2 --graph-size 10000 --num-iters 10
+```
 
 ## Arithmetic benchmarks
 
@@ -214,40 +239,14 @@ If `OMP_NUM_THREADS` is unset, the launcher divides the available hardware threa
 
 ## Tests
 
-The test programs are multi-process executables; they are built by CMake but are not registered with CTest.
+CMake builds eight multiprocess test executables under `build/test/`; they are not registered with CTest. Coverage includes RSS3 and NPH equality, signed comparison, shuffle, grouped shuffle/unshuffle, and NPH amortized Permute+Share. The application benchmarks also include cleartext correctness checks for supported workload sizes.
 
-| Target | Coverage | Processes |
-| --- | --- | --- |
-| `test_eqz3p` | RSS3 zero and equality checks | 3 |
-| `test_ltz3p` | RSS3 signed less-than-zero | 3 |
-| `test_eqz_nph` | NPH zero and equality checks | 3 compute + 1 helper |
-| `test_ltz_nph` | NPH LTZ over 8-, 16-, 32-, and 64-bit rings | Configurable compute parties + 1 helper |
-
-To run an RSS3 test locally:
-
-```bash
-build/test/test_eqz3p 0 &
-build/test/test_eqz3p 1 127.0.0.1 &
-build/test/test_eqz3p 2 127.0.0.1 &
-wait
-```
-
-To run the default three-compute-party NPH equality test:
-
-```bash
-build/test/test_eqz_nph 0 &
-build/test/test_eqz_nph 1 127.0.0.1 &
-build/test/test_eqz_nph 2 127.0.0.1 &
-build/test/test_eqz_nph 3 127.0.0.1 &
-wait
-```
-
-Each program prints `PASS` or `FAIL` after reconstructing and checking its outputs. Use distinct ports when running multiple test groups concurrently.
+See [test/README.md](test/README.md) for all targets, process counts, and launch commands.
 
 ## Security model
 
-CRiS-MPC targets semi-honest adversaries i.e. parties are assumed to follow the protocol but may inspect their local views. The NPH backend assumes a dedicated preprocessing helper and assumes that the helper does not collude with other computing parties. The code is intended for research and experimental benchmarking and has not been independently audited for production use.
+CRiS-MPC targets semi-honest adversaries i.e. parties are assumed to follow the protocol but may inspect their local views. RSS3 targets at most one corrupted compute party among three. NPH targets up to `n-1` corrupted compute parties, with a dedicated preprocessing helper that must not collude with the compute parties. The code is intended for research and experimental benchmarking and has not been independently audited for production use.
 
 ## License
 
-No license is currently provided. All rights remain with the repository owner unless a license is added.
+This project is licensed under the [MIT License](LICENSE).

@@ -1,6 +1,6 @@
 # GraSP
 
-This directory contains the implementation  of
+This directory contains the implementation of
 **GraSP: Secure Collaborative Graph Processing Made Scalable** : [IACR ePrint 2025/590](https://eprint.iacr.org/2025/590).
 
 GraSP securely evaluates message-passing graph algorithms when a graph is
@@ -27,6 +27,12 @@ and should not be used as a production cryptographic implementation.
 The three application targets implement the DCC initialization and iterative
 message-passing phases and report offline preprocessing, initialization,
 online, total, communication, and memory measurements.
+
+## Current scope
+
+The application drivers generate deterministic synthetic graphs and compute partition and order plans in plaintext. They do not provide a complete private input workflow for independently supplied owner graphs. The circuit uses secret-shared values and party-specific masked permutations derived from preprocessing.
+
+The partition utility assigns edges to the owner of their destination vertex. It includes neighboring vertices and padding in each subgraph. For sparse or isolated-vertex inputs, it enlarges the nominal `min(|V|, 2|E_i|)` vertex bound when necessary to retain required vertices.
 
 ## Security and execution model
 
@@ -68,7 +74,7 @@ provide a total graph size or explicit dimensions:
 
 ### PageRank
 
-The PageRank benchmark defaults to ten message-passing iterations:
+The PageRank benchmark defaults to ten message-passing iterations with `alpha = 1` and secret-shared `rho = 1`. Starting from vertex values of one, it repeatedly sums incoming values over the ring; conventional PageRank normalization and damping are not implemented:
 
 ```bash
 ./run.sh bench_PrMpaGraSP \
@@ -130,9 +136,11 @@ RESULTS_DIR=/tmp/grasp-results ./run.sh bench_PrMpaGraSP \
   --num-verts 1000 --num-edges 3000 --num-iters 5
 ```
 
+Application logs and JSON report `offline`, `init`, `online`, and `total`, with total equal to the sum of the first three phases. These totals exclude graph generation, circuit construction, connection warmup, and final output retrieval/checking. Graphiti BFS/PageRank report offline and online phases without a total field and exclude setup evaluation; its initialization cost is modeled by a separate microbenchmark. Compare phase definitions before comparing totals.
+
 For each phase, `parse_results.py` reports the maximum elapsed time across
-processes and the sum of bytes sent by all processes. The phases are `offline`,
-`online`, and `total`. If several timestamped runs match a configuration, the
+processes and the sum of bytes sent by all processes. The default tables report `offline`,
+`online`, and `total`; the Graphiti comparison modes also consume initialization measurements. If several timestamped runs match a configuration, the
 latest is selected.
 
 ## Reproduce evaluation sweeps
@@ -157,8 +165,7 @@ The default parameters are:
 | PageRank iterations | `10` |
 | Fixed compute-party count | `5` |
 | Fixed local graph size per party | `65536` |
-| Fixed parties | `5` |
-| Varyinh local graph size | `4096,8192,16384,32768,65536` |
+| Varying local graph size | `4096,8192,16384,32768,65536` |
 | Varying parties | `3,4,5,6,7,8,9,10` |
 
 Use `--mode graph-sweep` or `--mode party-sweep` to select one sweep. The WAN variant uses the corresponding paper comparison profile:
@@ -186,8 +193,7 @@ python3 benchmark/grasp/eval.py --applications_num_parties
 
 ### Regenerate tables without rerunning
 
-Add `--skip-run --skip-network` to any suite to build tables from existing
-and `--tc-off-at-end` to request best-effort traffic-control cleanup.
+Add `--skip-run --skip-network` to any suite to build tables from existing results. Use `--tc-off-at-end` to request best-effort traffic-control cleanup.
 
 
 ## Run the parser directly
@@ -227,10 +233,11 @@ CSV and Markdown output require only Python's standard library. Omit
 If you use this implementation, cite:
 
 ```bibtex
-@article{kapoor2025mathsf,
-  title={$$\backslash$mathsf $\{$GraSP$\}$ $: Secure Collaborative Graph Processing Made Scalable},
-  author={Kapoor, Siddharth and Koti, Nishat and Kukkala, Varsha Bhat and Patra, Arpita and Gopal, Bhavish Raj},
-  journal={Cryptology ePrint Archive},
-  year={2025}
+@misc{kapoor2025grasp,
+  title = {GraSP: Secure Collaborative Graph Processing Made Scalable},
+  author = {Siddharth Kapoor and Nishat Koti and Varsha Bhat Kukkala and Arpita Patra and Bhavish Raj Gopal},
+  howpublished = {Cryptology ePrint Archive, Paper 2025/590},
+  year = {2025},
+  url = {https://eprint.iacr.org/2025/590}
 }
 ```
