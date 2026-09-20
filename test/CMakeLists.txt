@@ -1,7 +1,28 @@
 # Tests for SS_PSI/3pc
-# The PSI root is on the include path so headers can be reached via "3pc/..." includes.
+# The PSI root is on the include path so headers can be reached via
+# "src/3pc/..." and "src/nph/..." includes.
 
 # ── 3PC RSS tests ─────────────────────────────────────────────────────────────
 add_executable(test_shuffle3p test_shuffle3p.cpp)
 target_link_libraries(test_shuffle3p PRIVATE emp-tool::emp-tool)
 
+add_executable(test_eqz3p test_eqz3p.cpp)
+target_link_libraries(test_eqz3p PRIVATE emp-tool::emp-tool)
+
+add_executable(test_ltz3p test_ltz3p.cpp)
+target_link_libraries(test_ltz3p PRIVATE emp-tool::emp-tool)
+
+add_executable(test_ltz_nph test_ltz_nph.cpp)
+target_link_libraries(test_ltz_nph PRIVATE emp-tool::emp-tool)
+
+add_executable(test_eqz_nph test_eqz_nph.cpp)
+target_link_libraries(test_eqz_nph PRIVATE emp-tool::emp-tool)
+
+add_executable(test_shuffle_nph_2p test_shuffle_nph_2p.cpp)
+target_link_libraries(test_shuffle_nph_2p PRIVATE emp-tool::emp-tool)
+
+add_executable(test_shuffle_nph_2p_grouped test_shuffle_nph_2p_grouped.cpp)
+target_link_libraries(test_shuffle_nph_2p_grouped PRIVATE emp-tool::emp-tool)
+
+add_executable(test_amor_permshare_nph test_amor_permshare_nph.cpp)
+target_link_libraries(test_amor_permshare_nph PRIVATE emp-tool::emp-tool)
