@@ -1,6 +1,6 @@
-# CRiS-MPC
+# CrIS-MPC
 
-CRiS-MPC implements graph-processing protocols and benchmarks from:
+CrIS-MPC implements graph-processing protocols and benchmarks from:
 
 - [Graphiti: Secure Graph Computation Made More Scalable](https://eprint.iacr.org/2024/1756).
 - [GraSP: Secure Collaborative Graph Processing Made Scalable](https://eprint.iacr.org/2025/590).
@@ -35,7 +35,7 @@ Arithmetic is performed using native unsigned 8-, 16-, 32-, or 64-bit types. Ove
 ## Repository structure
 
 ```text
-CRiS-MPC/
+CrIS-MPC/
 ├── src/
 │   ├── common/
 │   │   ├── circuit/           # Gates, circuit construction, and level ordering
@@ -91,7 +91,7 @@ cmake -S . -B build \
 
 ### Docker
 
-The supplied image builds `emp-tool` and CRiS-MPC on Ubuntu 22.04:
+The supplied image builds `emp-tool` and CrIS-MPC on Ubuntu 22.04:
 
 ```bash
 docker build -t cris-mpc .
@@ -245,7 +245,7 @@ See [test/README.md](test/README.md) for all targets, process counts, and launch
 
 ## Security model
 
-CRiS-MPC targets semi-honest adversaries i.e. parties are assumed to follow the protocol but may inspect their local views. RSS3 targets at most one corrupted compute party among three. NPH targets up to `n-1` corrupted compute parties, with a dedicated preprocessing helper that must not collude with the compute parties. The code is intended for research and experimental benchmarking and has not been independently audited for production use.
+CrIS-MPC targets semi-honest adversaries i.e. parties are assumed to follow the protocol but may inspect their local views. RSS3 targets at most one corrupted compute party among three. NPH targets up to `n-1` corrupted compute parties, with a dedicated preprocessing helper that must not collude with the compute parties. The code is intended for research and experimental benchmarking and has not been independently audited for production use.
 
 ## License
 
